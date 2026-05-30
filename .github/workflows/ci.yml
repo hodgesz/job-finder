@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint (ruff)
+        run: uvx ruff check .
+
+      - name: Format check (ruff)
+        run: uvx ruff format --check .
+
+      - name: Tests (pytest)
+        run: |
+          # pytest exits 5 when no tests are collected; treat that as success
+          # until the suite exists.
+          code=0
+          uv run --with pytest pytest || code=$?
+          if [ "$code" -eq 5 ]; then
+            echo "No tests collected yet — skipping."
+            exit 0
+          fi
+          exit "$code"
