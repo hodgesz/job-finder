@@ -132,6 +132,20 @@ def test_window_digest_hides_movement_that_predates_the_cutoff():
     assert "↑" not in out and "+0.15" not in out
 
 
+def test_windowed_digest_lists_new_signals_even_with_no_opportunities():
+    """A windowed report must still surface newly-appeared signals when the
+    store has no opportunity rows — they are the 'what changed' the title
+    promises, and a signal can appear before it scores into an opportunity."""
+    store = Store.in_memory()
+    # A signal but no opportunity (e.g. a lone departure not yet scored).
+    store.persist_run([_signal()], [], now=LATER)
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    out = render_digest(store.diff(since=cutoff), now=RENDER_NOW)
+    assert "No opportunities on file." in out
+    assert "Newly appeared signals (1):" in out
+    assert "https://example.com/8k" in out
+
+
 def test_standings_digest_omits_window_wording_and_new_signals_section():
     """Without --since there is no window: no "(N new this window)" and no
     "Newly appeared signals" section."""

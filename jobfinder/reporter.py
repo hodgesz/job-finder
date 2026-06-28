@@ -136,25 +136,27 @@ def render_digest(
     lines.append(header)
     lines.append("=" * len(header))
 
-    if not opportunities:
+    if opportunities:
+        # The "new this window" count and the newly-appeared-signals section only
+        # mean anything when there is a cutoff to be new *relative to*; without
+        # --since this is a plain ranked standings view.
+        count_line = f"{len(opportunities)} opportunities on file"
+        if has_window:
+            new_count = sum(1 for c in opportunities if c.is_new)
+            count_line += f" ({new_count} new this window)"
+        count_line += f"; showing {len(shown)}."
+        lines.append(count_line)
+
+        for rank, change in enumerate(shown, start=1):
+            lines.append("")
+            lines.extend(_render_opportunity(rank, change, now, has_window=has_window))
+    else:
         lines.append("")
         lines.append("No opportunities on file.")
-        return "\n".join(lines)
 
-    # The "new this window" count and the newly-appeared-signals section only
-    # mean anything when there is a cutoff to be new *relative to*; without
-    # --since this is a plain ranked standings view.
-    count_line = f"{len(opportunities)} opportunities on file"
-    if has_window:
-        new_count = sum(1 for c in opportunities if c.is_new)
-        count_line += f" ({new_count} new this window)"
-    count_line += f"; showing {len(shown)}."
-    lines.append(count_line)
-
-    for rank, change in enumerate(shown, start=1):
-        lines.append("")
-        lines.extend(_render_opportunity(rank, change, now, has_window=has_window))
-
+    # Even with no opportunities, a windowed report must still surface the
+    # signals that newly appeared — they ARE the "what changed" the title
+    # promises, and a signal can land before it scores into an opportunity.
     if has_window:
         lines.extend(_render_new_signals(diff.new_signals, now))
     return "\n".join(lines)
