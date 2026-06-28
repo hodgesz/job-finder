@@ -3,6 +3,7 @@
 from datetime import date, datetime, timezone
 
 from jobfinder.cli import (
+    _DEMO_PROFILE,
     _demo_companies,
     _parse_since,
     _store_url,
@@ -20,8 +21,15 @@ NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 
 def _run(companies):
     # Force the deterministic regex extractor so tests never touch a live LLM,
-    # mirroring what the `demo` CLI command does.
-    return run_pipeline(companies, observed_at=NOW, now=NOW, extractor=RegexExtractor())
+    # and apply the demo candidate profile so fit is *derived* — exactly what the
+    # `demo` CLI command does, so tests exercise the one canonical demo ranking.
+    return run_pipeline(
+        companies,
+        candidate_profile=_DEMO_PROFILE,
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
 
 
 def test_run_pipeline_ranks_funding_plus_vacuum_first():
@@ -68,8 +76,10 @@ def test_pipeline_company_with_no_signals_is_dropped():
 def test_demo_dataset_produces_ranked_opportunities():
     opps = _run(_demo_companies())
     ids = [o.company_id for o in opps]
-    # Northwind (all four pillars) leads; Helix is the ATS-only company.
-    assert ids == ["co-northwind", "co-lumen", "co-helix", "co-atlas"]
+    # Northwind (all four pillars + a perfect firmographic fit) leads. Atlas now
+    # outranks Helix: a CFO vacuum plus a perfect Logistics/Series A fit beats
+    # Helix's hiring-only signals on an off-profile (AI/seed) firmographic.
+    assert ids == ["co-northwind", "co-lumen", "co-atlas", "co-helix"]
 
 
 def test_demo_northwind_is_funding_plus_vacuum():
@@ -142,19 +152,77 @@ def test_main_demo_top_flag(capsys):
 
 def test_run_pipeline_detailed_returns_signals_and_opportunities():
     result = run_pipeline_detailed(
-        _demo_companies(), observed_at=NOW, now=NOW, extractor=RegexExtractor()
+        _demo_companies(),
+        candidate_profile=_DEMO_PROFILE,
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
     )
     # Same ranking as run_pipeline, plus the raw signals that produced it.
     assert [o.company_id for o in result.opportunities] == [
         "co-northwind",
         "co-lumen",
-        "co-helix",
         "co-atlas",
+        "co-helix",
     ]
     assert result.signals
     # Every cited supporting signal is present in the returned signal list.
     cited = {sid for o in result.opportunities for sid in o.supporting_signal_ids}
     assert cited <= {s.id for s in result.signals}
+
+
+def test_demo_fit_is_derived_not_hardcoded():
+    # Slice 8: the demo companies' fit is derived from firmographics, not the old
+    # hand-set magic numbers. Northwind (Robotics/Series B/180) is a perfect
+    # match; Helix (AI/seed/35) is off-profile and lower.
+    opps = _run(_demo_companies())
+    by_id = {o.company_id: o for o in opps}
+    assert by_id["co-northwind"].fit_score == 1.0
+    assert by_id["co-helix"].fit_score < 0.5
+    # And the reason is visible in the why_now (explainable end to end).
+    assert "Robotics matches target sector" in by_id["co-northwind"].why_now
+
+
+def test_demo_atlas_outranks_helix_on_fit():
+    # A perfect firmographic fit (Logistics/Series A) plus a CFO vacuum lifts
+    # Atlas above hiring-only Helix on an off-profile firmographic — the headline
+    # effect of wiring company_fit.
+    opps = _run(_demo_companies())
+    ids = [o.company_id for o in opps]
+    assert ids.index("co-atlas") < ids.index("co-helix")
+
+
+def test_pipeline_without_profile_uses_literal_company_fit():
+    # No candidate_profile -> the literal CompanyInputs.company_fit is used and
+    # no firmographic reason appears (pre-Slice-8 behaviour preserved).
+    company = CompanyInputs(
+        company_id="co-x",
+        name="X",
+        form_d=[
+            (
+                Filing(
+                    cik="1",
+                    accession_number="acc-x",
+                    form="D",
+                    filing_date=date(2026, 5, 1),
+                    report_date=None,
+                    items=[],
+                    primary_document="primary_doc.xml",
+                ),
+                FormD(
+                    issuer_cik="1",
+                    issuer_name="X",
+                    accession_number="acc-x",
+                    total_amount_sold=10_000_000.0,
+                    total_remaining=0.0,
+                ),
+            )
+        ],
+        company_fit=0.77,
+    )
+    opps = run_pipeline([company], observed_at=NOW, now=NOW, extractor=RegexExtractor())
+    assert opps[0].fit_score == 0.77
+    assert "Fit " not in opps[0].why_now
 
 
 def test_store_url_maps_path_vs_scheme():
@@ -179,8 +247,8 @@ def test_main_demo_persists_to_sqlite(tmp_path, capsys):
     assert [o.company_id for o in opps] == [
         "co-northwind",
         "co-lumen",
-        "co-helix",
         "co-atlas",
+        "co-helix",
     ]
     assert store.signals_for_company("co-northwind")
 

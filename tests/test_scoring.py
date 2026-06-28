@@ -366,6 +366,62 @@ def test_build_opportunity_derives_persona_from_cited_signals_only():
     assert opp.target_persona == DEFAULT_PERSONA
 
 
+def test_company_fit_reason_rides_into_note_and_why_now():
+    # A derived fit reason flows into the company_fit component note and an
+    # explicit clause in why_now, keeping fit as explainable as the score.
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    breakdown = score_company(
+        "co-1",
+        [funding],
+        company_fit=0.9,
+        company_fit_reason="Robotics matches target sector; ~180 ppl in target size",
+        now=NOW,
+    )
+    fit = breakdown.component("company_fit")
+    assert fit.raw == 0.9
+    # The reason is carried structurally (not folded into the display note).
+    assert fit.note == "firmographic fit"
+    assert fit.reason == ("Robotics matches target sector; ~180 ppl in target size")
+    opp = build_opportunity(breakdown, signals=[funding])
+    assert "Fit 90%: Robotics matches target sector" in opp.why_now
+
+
+def test_company_fit_reason_with_emdash_is_not_truncated():
+    # A reason containing an em-dash + space must survive intact into why_now —
+    # the structured `reason` field, not a note string-split, carries it now.
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    reason = "Robotics — Industrial matches target sector"
+    breakdown = score_company(
+        "co-1", [funding], company_fit=0.9, company_fit_reason=reason, now=NOW
+    )
+    opp = build_opportunity(breakdown, signals=[funding])
+    assert f"Fit 90%: {reason}." in opp.why_now
+
+
+def test_company_fit_without_reason_keeps_caller_supplied_note():
+    # The pre-Slice-8 path: a bare fit float, no reason -> the old note and no
+    # fit clause in why_now.
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    breakdown = score_company("co-1", [funding], company_fit=0.6, now=NOW)
+    assert breakdown.component("company_fit").note == "caller-supplied fit"
+    opp = build_opportunity(breakdown, signals=[funding])
+    assert "Fit " not in opp.why_now
+
+
+def test_rank_threads_per_company_fit_and_reasons():
+    signals = {
+        "co-1": [_signal("s-1", "form_d_funding", strength=0.9)],
+    }
+    ranked = rank_opportunities(
+        signals,
+        company_fit={"co-1": 0.95},
+        company_fit_reasons={"co-1": "Logistics matches target sector"},
+        now=NOW,
+    )
+    assert ranked[0].fit_score == 0.95
+    assert "Logistics matches target sector" in ranked[0].why_now
+
+
 def test_rank_orders_companies_best_first_and_skips_empty():
     high = [
         _signal("a-fund", "form_d_funding", strength=0.9, facts={}),
