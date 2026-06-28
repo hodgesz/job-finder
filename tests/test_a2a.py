@@ -134,6 +134,24 @@ def test_graph_short_circuits_non_502_filing():
     assert resp.signals == []
 
 
+def test_graph_is_hermetic_by_default_even_with_api_key(monkeypatch):
+    # The standing service must NOT make a live Gemini call per request just
+    # because GEMINI_API_KEY happens to be in its environment. With no injected
+    # extractor, extract_signals pins the deterministic RegexExtractor.
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-should-never-be-used")
+
+    # Trip-wire: if the env-resolved Gemini path is ever reached, fail loudly
+    # instead of making a network call.
+    def _boom(*args, **kwargs):
+        raise AssertionError("GeminiExtractor.from_env() must not run in the service")
+
+    monkeypatch.setattr("jobfinder.signals.extraction.GeminiExtractor.from_env", _boom)
+
+    resp = extract_signals(_request(["5.02"], VACUUM_DOC))
+    departure = next(s for s in resp.signals if s.signal_type == "8k_exec_departure")
+    assert departure.extracted_facts["extraction_method"] == "regex_fallback"
+
+
 def test_graph_uses_injected_extractor_and_reports_llm_method():
     canned = ExtractedEvents(
         events=[ExecEvent(event_type="departure", officer_name="Jane Doe", role="CFO")],
@@ -213,6 +231,47 @@ async def test_service_agent_reports_error_on_malformed_request():
 
     payload = json.loads(chunks[-1])
     assert payload["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_service_agent_reports_error_on_downstream_failure():
+    # A request that parses cleanly can still blow up downstream: a non-numeric
+    # cik survives schema validation but breaks Filing.primary_document_url
+    # (which calls int(cik)) while building Evidence. The service boundary must
+    # answer with structured JSON, not crash the A2A stream.
+    from google.adk.runners import InMemoryRunner
+    from google.genai import types
+
+    agent = build_agent()
+    bad = EightKExtractionRequest(
+        company_id="apple",
+        filing=FilingRef(
+            cik="not-a-number",
+            accession_number="0001140361-26-015711",
+            items=["5.02"],
+            primary_document="x.htm",
+        ),
+        document=VACUUM_DOC,
+    )
+    # The unguarded sync surface raises...
+    with pytest.raises(ValueError):
+        agent.run_extraction(bad.model_dump_json())
+
+    # ...but the agent loop wraps it into a structured error event.
+    runner = InMemoryRunner(agent=agent, app_name="test_a2a_down")
+    session = await runner.session_service.create_session(
+        app_name="test_a2a_down", user_id="u"
+    )
+    message = types.Content(role="user", parts=[types.Part(text=bad.model_dump_json())])
+    chunks: list[str] = []
+    async for event in runner.run_async(
+        user_id="u", session_id=session.id, new_message=message
+    ):
+        if event.content and event.content.parts:
+            chunks.append("".join(p.text or "" for p in event.content.parts))
+
+    payload = json.loads(chunks[-1])
+    assert payload["error"] == "extraction_failed"
 
 
 # --- Agent card + to_a2a() Starlette app ------------------------------------

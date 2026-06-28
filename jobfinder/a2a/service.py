@@ -54,9 +54,10 @@ def _extract_request_text(content: types.Content | None) -> str:
 class EightKSignalAgent(BaseAgent):
     """Custom ADK agent that runs the LangGraph 8-K specialist.
 
-    The extractor is injected and defaults to None, which makes the underlying
-    graph use the deterministic regex fallback unless a Gemini client is
-    resolved from the environment — keeping the agent loop hermetic in tests.
+    The extractor is injected and defaults to None; the underlying
+    ``extract_signals`` then pins a deterministic ``RegexExtractor``, so the
+    service stays hermetic by default (no live Gemini, even with
+    ``GEMINI_API_KEY`` set). Inject a ``GeminiExtractor`` to opt into the LLM.
     """
 
     # BaseAgent is a pydantic model; declare the extra field so assignment
@@ -91,6 +92,12 @@ class EightKSignalAgent(BaseAgent):
             payload = json.dumps(
                 {"error": "invalid_request", "detail": json.loads(exc.json())}
             )
+        except Exception as exc:
+            # A request can parse cleanly yet still fail downstream (e.g. a
+            # non-numeric cik blows up Filing.primary_document_url). A service
+            # boundary must answer with structured JSON, not crash the A2A
+            # stream and hand the client an opaque 500.
+            payload = json.dumps({"error": "extraction_failed", "detail": str(exc)})
         yield Event(
             author=self.name,
             invocation_id=ctx.invocation_id,

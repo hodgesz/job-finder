@@ -17,10 +17,11 @@ The graph has two nodes:
                    extractor.
     extract     -> runs the injected extractor and builds Signal objects.
 
-Hermeticity: the extractor is injected via graph state (``extractor``), so the
-graph never reaches for a live Gemini client on its own. In tests and CI no
-extractor (or a ``RegexExtractor``) is passed and the deterministic regex path
-runs; a real ``GeminiExtractor`` can be injected in production.
+Hermeticity: the extractor is injected via graph state (``extractor``), and
+``extract_signals`` pins a ``RegexExtractor`` when none is supplied, so the
+service never reaches for a live Gemini client on its own — even if
+``GEMINI_API_KEY`` is set in its environment. The LLM is strictly opt-in: a
+real ``GeminiExtractor`` is injected deliberately in production.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from langgraph.graph import END, START, StateGraph
 
 from jobfinder.a2a.contract import EightKExtractionRequest, EightKExtractionResponse
 from jobfinder.schemas import Signal
-from jobfinder.signals.extraction import Extractor
+from jobfinder.signals.extraction import Extractor, RegexExtractor
 from jobfinder.signals.sec_8k import discloses_item_502, signals_from_filing
 
 
@@ -116,11 +117,17 @@ def extract_signals(
 ) -> EightKExtractionResponse:
     """Run a request through the compiled graph and shape the wire response.
 
-    This is the synchronous entry point the ADK service node calls. The
-    extractor is injected (default None -> hermetic regex fallback unless a
-    GeminiExtractor is resolved from the environment by the in-process path).
+    This is the synchronous entry point the ADK service node calls. The LLM is
+    strictly opt-in here: when no ``extractor`` is injected the service pins the
+    deterministic ``RegexExtractor`` so it is genuinely hermetic by default —
+    unlike the in-process pipeline, which leaves ``extractor=None`` so it can
+    resolve a ``GeminiExtractor`` from ``GEMINI_API_KEY``. A standing service
+    must not silently make paid/live model calls per request just because a key
+    happens to be in its environment; production injects a Gemini extractor
+    deliberately.
     """
-    final = GRAPH.invoke({"request": request, "extractor": extractor})
+    chosen = extractor or RegexExtractor()
+    final = GRAPH.invoke({"request": request, "extractor": chosen})
     return EightKExtractionResponse(
         company_id=request.company_id,
         signals=final.get("signals", []),
