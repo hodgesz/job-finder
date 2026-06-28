@@ -21,13 +21,13 @@ the pipeline:
 
 ```
   ┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-  │  Collectors  │ → │  Normalizer   │ → │  Correlator   │ → │   Scorer      │
-  │ (per signal) │    │ (dedup/clean) │    │ (join by org) │    │ (intent rank) │
+  │  Collectors │ →  │  Normalizer  │ →  │  Correlator  │ →  │   Scorer     │
+  │ (per signal)│    │ (dedup/clean)│    │ (join by org)│    │ (intent rank)│
   └─────────────┘    └──────────────┘    └──────────────┘    └──────┬───────┘
-                                                                      ↓
+                                                                    ↓
                                                               ┌──────────────┐
-                                                              │   Reporter    │
-                                                              │ (digest/feed) │
+                                                              │   Reporter   │
+                                                              │ (digest/feed)│
                                                               └──────────────┘
 ```
 
