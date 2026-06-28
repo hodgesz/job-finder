@@ -27,7 +27,9 @@ from sqlalchemy import (
     String,
     Table,
     create_engine,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
@@ -66,10 +68,72 @@ opportunities_table = Table(
     Column("opportunity_type", String, nullable=False),
     Column("score", Float, nullable=False, index=True),
     Column("status", String, nullable=False),
+    # The score this row held *before* its most recent upsert. NULL on first
+    # insert (nothing to compare to). It lets the Reporter show rank/score
+    # movement across runs without snapshotting full history: the upsert keeps
+    # one row per opportunity, so without carrying the prior score forward the
+    # old value would be overwritten and lost. This is an audit scalar, not part
+    # of the pydantic Opportunity (schemas.py stays pure).
+    Column("previous_score", Float, nullable=True),
     Column("first_seen_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
     Column("payload", JSON, nullable=False),
 )
+
+
+@dataclass(frozen=True)
+class OpportunityChange:
+    """One opportunity in the current standings, annotated with cross-run facts.
+
+    The annotations come straight from the store's own bookkeeping —
+    ``first_seen_at`` (stamped once), ``updated_at`` (advances each save) and the
+    carried-forward ``previous_score`` — so a Reporter can tell new from
+    recurring and show score movement without ever re-deriving history from raw
+    rows.
+    """
+
+    opportunity: Opportunity
+    first_seen_at: datetime
+    updated_at: datetime
+    previous_score: float | None
+    # first_seen_at >= the diff cutoff: this opportunity appeared this window.
+    is_new: bool
+    # updated_at >= the diff cutoff: this opportunity was (re)saved this window.
+    changed_in_window: bool
+
+    @property
+    def score_delta(self) -> float | None:
+        """How much the score moved on its last upsert, if there is a prior."""
+        if self.previous_score is None:
+            return None
+        return round(self.opportunity.score - self.previous_score, 4)
+
+
+@dataclass(frozen=True)
+class SignalChange:
+    """A signal that first appeared in the diff window, with its appearance time.
+
+    Every entry in a ``StoreDiff.new_signals`` list is by construction new (the
+    query only selects signals whose ``first_seen_at`` is on/after the cutoff),
+    so there is no ``is_new`` flag — the list itself carries that meaning."""
+
+    signal: Signal
+    first_seen_at: datetime
+
+
+@dataclass(frozen=True)
+class StoreDiff:
+    """A cross-run view of the store relative to a ``since`` cutoff.
+
+    ``opportunities`` is the full current standings ranked best-first (each tagged
+    new/recurring); ``new_signals`` are the signals that first appeared in the
+    window. When ``since`` is None there is no baseline to diff against, so
+    nothing is tagged new and ``new_signals`` is empty — a plain ranked digest.
+    """
+
+    since: datetime | None
+    opportunities: list[OpportunityChange]
+    new_signals: list[SignalChange]
 
 
 @dataclass(frozen=True)
@@ -185,6 +249,36 @@ class Store:
 
     def create_all(self) -> None:
         _metadata.create_all(self.engine)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a store was first created.
+
+        ``create_all`` only issues ``CREATE TABLE IF NOT EXISTS`` — it never
+        alters a table that already exists, so a DB file written by an earlier
+        slice keeps its old column set. Without this, opening a pre-Slice-6
+        store and calling :meth:`diff` (or re-persisting, which hits the
+        ``previous_score`` UPDATE) raises ``OperationalError: no such column``.
+        We additively ``ALTER TABLE ... ADD COLUMN`` any declared column the
+        live table is missing — portable across SQLite and Postgres and safe to
+        run every construction (we only add what's absent).
+        """
+        inspector = inspect(self.engine)
+        existing_tables = set(inspector.get_table_names())
+        with self.engine.begin() as conn:
+            for table in _metadata.tables.values():
+                if table.name not in existing_tables:
+                    continue  # create_all already made it with every column.
+                present = {c["name"] for c in inspector.get_columns(table.name)}
+                for column in table.columns:
+                    if column.name in present:
+                        continue
+                    coltype = column.type.compile(self.engine.dialect)
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {coltype}'
+                        )
+                    )
 
     # ------------------------------------------------------------------ #
     # Writes.
@@ -288,6 +382,60 @@ class Store:
             rows = conn.execute(stmt).all()
         return [Opportunity.model_validate(r[0]) for r in rows]
 
+    def diff(self, *, since: datetime | None = None) -> StoreDiff:
+        """Cross-run diff of the whole store relative to ``since``.
+
+        Returns the current opportunity standings (ranked best-first, each tagged
+        new vs recurring and carrying its prior score) plus the signals that
+        first appeared on or after ``since``. With ``since=None`` there is no
+        baseline, so nothing is flagged new — the caller gets a plain ranked
+        digest. This is the one query a Reporter needs; it keeps all the
+        timestamp/score bookkeeping in the store rather than the Reporter.
+        """
+        since_iso = _iso(since) if since is not None else None
+        opp_changes: list[OpportunityChange] = []
+        sig_changes: list[SignalChange] = []
+        with self.engine.connect() as conn:
+            opp_rows = conn.execute(
+                select(
+                    opportunities_table.c.payload,
+                    opportunities_table.c.previous_score,
+                    opportunities_table.c.first_seen_at,
+                    opportunities_table.c.updated_at,
+                ).order_by(opportunities_table.c.score.desc())
+            ).all()
+            for payload, prev_score, first_seen_at, updated_at in opp_rows:
+                opp_changes.append(
+                    OpportunityChange(
+                        opportunity=Opportunity.model_validate(payload),
+                        first_seen_at=datetime.fromisoformat(first_seen_at),
+                        updated_at=datetime.fromisoformat(updated_at),
+                        previous_score=prev_score,
+                        is_new=since_iso is not None and first_seen_at >= since_iso,
+                        changed_in_window=since_iso is not None
+                        and updated_at >= since_iso,
+                    )
+                )
+
+            sig_stmt = select(
+                signals_table.c.payload, signals_table.c.first_seen_at
+            ).order_by(signals_table.c.observed_at.desc())
+            # Only the genuinely new signals are interesting in a "what changed"
+            # view; with no baseline there is nothing new to report.
+            if since_iso is not None:
+                sig_stmt = sig_stmt.where(signals_table.c.first_seen_at >= since_iso)
+                sig_rows = conn.execute(sig_stmt).all()
+                for payload, first_seen_at in sig_rows:
+                    sig_changes.append(
+                        SignalChange(
+                            signal=Signal.model_validate(payload),
+                            first_seen_at=datetime.fromisoformat(first_seen_at),
+                        )
+                    )
+        return StoreDiff(
+            since=since, opportunities=opp_changes, new_signals=sig_changes
+        )
+
     def first_seen(self, table: str, row_id: str) -> datetime | None:
         """When a signal/opportunity id was first persisted (for cross-run diffs)."""
         try:
@@ -315,9 +463,14 @@ class Store:
         """
         table, scalars = _row_spec(model)
         now_iso = _iso(now)
-        existing = conn.execute(
-            select(table.c.first_seen_at).where(table.c.id == model.id)
-        ).first()
+        is_opp = table is opportunities_table
+        # For opportunities, also read the current score so we can carry it into
+        # `previous_score` on update — that is what makes rank/score movement
+        # derivable across runs from a single upserted row.
+        cols = [table.c.first_seen_at]
+        if is_opp:
+            cols.append(table.c.score)
+        existing = conn.execute(select(*cols).where(table.c.id == model.id)).first()
         values = {
             **scalars,
             "payload": model.model_dump(mode="json"),
@@ -328,5 +481,8 @@ class Store:
                 table.insert().values(id=model.id, first_seen_at=now_iso, **values)
             )
             return True
+        if is_opp:
+            # existing == (first_seen_at, score); preserve the pre-update score.
+            values["previous_score"] = existing[1]
         conn.execute(table.update().where(table.c.id == model.id).values(**values))
         return False

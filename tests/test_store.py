@@ -220,3 +220,107 @@ def test_tables_are_registered():
     # Guard against a silent rename breaking the schema contract.
     assert signals_table.name == "signals"
     assert opportunities_table.name == "opportunities"
+
+
+# --------------------------------------------------------------------------- #
+# Cross-run diff (Slice 6): previous_score carry-forward + Store.diff.
+# --------------------------------------------------------------------------- #
+def test_previous_score_is_null_on_insert_then_carried_on_update(store: Store):
+    store.save_opportunity(_opportunity(score=0.40), now=NOW)
+    [first] = store.diff().opportunities
+    assert first.previous_score is None
+    assert first.score_delta is None
+
+    # Re-save with a higher score: the prior score must be carried forward.
+    store.save_opportunity(_opportunity(score=0.55), now=LATER)
+    [second] = store.diff().opportunities
+    assert second.previous_score == 0.40
+    assert second.opportunity.score == 0.55
+    assert second.score_delta == 0.15
+
+
+def test_diff_without_since_flags_nothing_new(store: Store):
+    store.persist_run([_signal()], [_opportunity()], now=NOW)
+    diff = store.diff()
+    assert diff.since is None
+    assert len(diff.opportunities) == 1
+    assert diff.opportunities[0].is_new is False
+    assert diff.opportunities[0].changed_in_window is False
+    # No baseline -> no "newly appeared" signals listed.
+    assert diff.new_signals == []
+
+
+def test_diff_since_splits_new_from_recurring(store: Store):
+    # An opportunity + signal first seen at NOW (before the cutoff)...
+    store.persist_run([_signal("old:departure")], [_opportunity("opp:old")], now=NOW)
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    # ...and a second pair first seen at LATER (after the cutoff).
+    store.persist_run(
+        [_signal("new:departure", company_id="co-2")],
+        [_opportunity("opp:new", company_id="co-2", signal_ids=["new:departure"])],
+        now=LATER,
+    )
+
+    diff = store.diff(since=cutoff)
+    by_id = {c.opportunity.id: c for c in diff.opportunities}
+    assert by_id["opp:new"].is_new is True
+    assert by_id["opp:old"].is_new is False
+    # Only the signal first seen after the cutoff is "newly appeared".
+    assert [s.signal.id for s in diff.new_signals] == ["new:departure"]
+
+
+def test_diff_orders_opportunities_best_first(store: Store):
+    store.save_opportunity(
+        _opportunity("opp:lo", company_id="co-lo", score=0.2), now=NOW
+    )
+    store.save_opportunity(
+        _opportunity("opp:hi", company_id="co-hi", score=0.9), now=NOW
+    )
+    diff = store.diff()
+    assert [c.opportunity.id for c in diff.opportunities] == ["opp:hi", "opp:lo"]
+
+
+def test_diff_changed_in_window_tracks_updated_at(store: Store):
+    store.save_opportunity(_opportunity(score=0.4), now=NOW)
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    # Not touched since the cutoff -> not changed this window.
+    assert store.diff(since=cutoff).opportunities[0].changed_in_window is False
+    # Re-save after the cutoff -> changed this window (but still not "new").
+    store.save_opportunity(_opportunity(score=0.6), now=LATER)
+    changed = store.diff(since=cutoff).opportunities[0]
+    assert changed.changed_in_window is True
+    assert changed.is_new is False
+
+
+def test_opens_pre_slice6_db_by_migrating_missing_column(tmp_path):
+    """A store written before `previous_score` existed must still open: the
+    additive migration backfills the column instead of crashing diff()/re-save.
+    """
+    from sqlalchemy import JSON, Column, Float, MetaData, String, Table, create_engine
+
+    db = tmp_path / "legacy.db"
+    url = f"sqlite+pysqlite:///{db}"
+    # Build an opportunities table with the OLD column set (no previous_score).
+    legacy = MetaData()
+    Table(
+        "opportunities",
+        legacy,
+        Column("id", String, primary_key=True),
+        Column("company_id", String, nullable=False),
+        Column("opportunity_type", String, nullable=False),
+        Column("score", Float, nullable=False),
+        Column("status", String, nullable=False),
+        Column("first_seen_at", String, nullable=False),
+        Column("updated_at", String, nullable=False),
+        Column("payload", JSON, nullable=False),
+    )
+    legacy.create_all(create_engine(url))
+
+    # Opening with the current Store runs the migration; both read and the
+    # previous_score UPDATE path must now work.
+    store = Store(url)
+    assert store.diff().opportunities == []
+    assert store.save_opportunity(_opportunity(score=0.4), now=NOW) is True
+    assert store.save_opportunity(_opportunity(score=0.6), now=LATER) is False
+    [change] = store.diff().opportunities
+    assert change.previous_score == 0.4
