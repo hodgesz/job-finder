@@ -1,0 +1,15 @@
+{
+  "cik": "1950000",
+  "name": "Northwind Robotics Inc.",
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0001950000-26-000003", "0001950000-26-000001", "0001950000-25-000002"],
+      "filingDate": ["2026-04-20", "2026-04-18", "2025-09-10"],
+      "reportDate": ["", "", ""],
+      "form": ["D", "D/A", "D"],
+      "items": ["", "", ""],
+      "primaryDocument": ["primary_doc.xml", "primary_doc.xml", "primary_doc.xml"],
+      "primaryDocDescription": ["", "", ""]
+    }
+  }
+}

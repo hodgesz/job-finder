@@ -112,6 +112,18 @@ def regex_fallback(document: str, *, item_known: bool | None = None) -> Extracte
     )
 
 
+class RegexExtractor:
+    """Deterministic extractor that always uses the regex parser.
+
+    Injecting this forces the offline path even when a GEMINI_API_KEY is set in
+    the environment — used by the CLI demo so its output is reproducible and
+    never makes a network call.
+    """
+
+    def extract(self, document: str) -> ExtractedEvents:
+        return regex_fallback(document)
+
+
 class GeminiExtractor:
     """Item 5.02 extractor backed by Gemini structured output.
 

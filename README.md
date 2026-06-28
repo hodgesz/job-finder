@@ -91,6 +91,12 @@ uv sync
 # Run the entry point
 uv run python main.py
 
+# Rank companies where a senior finance role may be forming.
+# `demo` uses a built-in offline dataset (no network, no API key):
+uv run python -m jobfinder.cli demo
+# `live` fetches real EDGAR filings (SEC requires a contact User-Agent):
+uv run python -m jobfinder.cli live --cik 320193 --user-agent "job-finder you@example.com"
+
 # Run the tests
 uv run pytest
 ```
@@ -109,12 +115,12 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 ## Roadmap
 
 - [x] Project scaffolding, CI, and tooling
-- [ ] Collector agent framework + common signal schema
-- [ ] Pillar II: SEC Form D collector (EDGAR)
-- [ ] Pillar III: SEC 8-K Item 5.02 collector (EDGAR)
+- [x] Common signal schema (`Signal` / `Opportunity` / `Evidence` / `Company`)
+- [x] Pillar III: SEC 8-K Item 5.02 collector (EDGAR) + LLM extraction pass
+- [x] Pillar II: SEC Form D collector (EDGAR)
+- [x] Composite intent scorer + ranked-opportunity CLI demo
 - [ ] Pillar I: ATS collectors (Greenhouse / Lever / Ashby)
-- [ ] Correlator + composite intent scorer
-- [ ] Reporter (digest output)
+- [ ] Persistence (Postgres) + reporter (digest output)
 - [ ] Enrichment integrations (contacts, firmographics)
 
 ## Legal & ethical use
