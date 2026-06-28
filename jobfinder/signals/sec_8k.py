@@ -35,6 +35,11 @@ from jobfinder.sources.edgar import Filing
 
 ITEM_502 = "5.02"
 
+# Match the actual item label "Item 5.02", not a bare "5.02" substring (which
+# would also fire on "15.02", "5.02%", "$15.02", etc.). The index `items`
+# field remains the authoritative source; this is only the body fallback.
+_ITEM_502_LABEL_RE = re.compile(r"\bitem\s*5\.02\b", re.IGNORECASE)
+
 # Roles we care most about for executive-opportunity detection.
 _EXEC_ROLE_PATTERNS = {
     "CEO": r"chief executive officer|\bCEO\b",
@@ -121,9 +126,8 @@ def parse_item_502(document: str, *, item_known: bool | None = None) -> ExecEven
     oddly in the body.
     """
     text = strip_html(document)
-    lowered = text.lower()
 
-    has_item = bool(item_known) or "item 5.02" in lowered or "5.02" in lowered
+    has_item = bool(item_known) or bool(_ITEM_502_LABEL_RE.search(text))
 
     # Detect events against the body with the boilerplate caption removed, so
     # the caption's own "Departure/Election/Appointment" wording is not read

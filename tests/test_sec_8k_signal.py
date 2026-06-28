@@ -105,6 +105,28 @@ def test_vacuum_filing_produces_high_strength_departure():
     assert departure.strength >= 0.7  # vacuum is the higher-value signal
 
 
+def test_bare_502_number_not_treated_as_item_502():
+    # "15.02%" must not trip Item 5.02 detection when the index doesn't say so.
+    doc = (
+        "Item 2.02 Results of Operations. Revenue rose 15.02% this quarter. "
+        "The former controller resigned in an unrelated matter years ago."
+    )
+    events = parse_item_502(doc)  # item_known not provided
+    assert not events.has_item_502
+    # And no signals should be emitted for a filing whose index lacks 5.02.
+    signals = signals_from_filing(
+        _filing(["2.02", "9.01"]), doc, company_id="co-x", observed_at=OBSERVED
+    )
+    assert signals == []
+
+
+def test_item_label_still_detected_in_body_fallback():
+    # When the index is unavailable, a real "Item 5.02" label is still detected.
+    events = parse_item_502(VACUUM_DOC)  # no item_known
+    assert events.has_item_502
+    assert events.is_leadership_vacuum
+
+
 def test_non_502_filing_yields_no_signals():
     # An earnings 8-K (Item 2.02) with no exec language.
     doc = "Item 2.02 Results of Operations. The Company reported quarterly revenue."
