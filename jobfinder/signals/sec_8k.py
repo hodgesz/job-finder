@@ -171,6 +171,19 @@ def parse_item_502(document: str, *, item_known: bool | None = None) -> ExecEven
     )
 
 
+def discloses_item_502(items: list[str], document: str) -> bool:
+    """Cheap pre-filter: does this filing disclose Item 5.02 at all?
+
+    The index ``items`` field is authoritative; fall back to scanning the body
+    for the literal item label. Shared by ``signals_from_filing`` and the A2A
+    graph's pre-filter node so both gate the (possibly LLM-backed) extractor
+    the same way.
+    """
+    if ITEM_502 in items:
+        return True
+    return bool(_ITEM_502_LABEL_RE.search(strip_html(document)))
+
+
 def _utcnow() -> datetime:
     # Wrapped so callers/tests can monkeypatch if they need determinism.
     return datetime.now(timezone.utc)
@@ -198,7 +211,7 @@ def signals_from_filing(
     # Cheap pre-filter: only filings whose index discloses 5.02 reach the
     # (possibly LLM-backed) extractor. The `items` field is authoritative.
     item_known = ITEM_502 in filing.items
-    if not item_known and not _ITEM_502_LABEL_RE.search(strip_html(document)):
+    if not discloses_item_502(filing.items, document):
         return []
 
     # Lazy import avoids a circular dependency (extraction imports this module).

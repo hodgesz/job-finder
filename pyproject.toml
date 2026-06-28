@@ -6,21 +6,26 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.14.5"
 dependencies = [
+    "google-adk[a2a]>=2.3.0",
     "google-genai>=2.7.0",
     "groq>=1.4.0",
     "ipykernel>=7.2.0",
+    "langgraph>=1.2.6",
     "openai>=2.38.0",
     "psycopg[binary]>=3.2",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "sqlalchemy>=2.0",
+    "sse-starlette>=3.4.5",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+asyncio_mode = "auto"
