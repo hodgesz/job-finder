@@ -27,6 +27,7 @@ and the weights already summed to 1.0; the scorer is the stable seam.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -54,10 +55,127 @@ _STRATEGIC_TYPES = {"greenfield_team", "tech_stack_change"}
 # searches move on a months-not-years horizon; ~120 days is a generous window.
 RECENCY_HORIZON_DAYS = 120.0
 
-# The persona this slice's demo hunts for. Callers can override per-opportunity
-# via `build_opportunity(..., target_persona=...)`; a signal-driven persona
-# model (e.g. read the departed role) is future work, not wired yet.
+# Persona used when no supporting signal names a role or department of its own
+# (e.g. a funding-only opportunity — capital raised is a liquidity signal, not a
+# persona source). Also the explicit override fallback for `build_opportunity`.
 DEFAULT_PERSONA = "CFO / VP Finance"
+
+# Which signal types carry a role/department we can read a persona from, in
+# priority order. A confirmed leadership *vacuum* (an exec seat already vacated,
+# from an 8-K) is the strongest persona source — there is a specific open role —
+# ahead of a hiring build-out (a department surge) and a founding/greenfield req,
+# which only *imply* a forming seat. Funding signals carry no role and are absent
+# here, so a funding-only opportunity falls back to DEFAULT_PERSONA.
+_PERSONA_SIGNAL_PRIORITY = (
+    "8k_exec_departure",
+    "department_surge",
+    "greenfield_team",
+)
+
+# Maps a role/department mention (matched case-insensitively, first hit wins) to
+# the persona to hunt for. The patterns read both the explicit role strings 8-K
+# extraction carries (`extracted_facts["roles"]`, e.g. "Chief Financial Officer",
+# "CFO") and the department/title text the ATS signals carry.
+#
+# ORDER MATTERS — rules are tried top to bottom, first match wins, so the table
+# is ordered SPECIFIC FUNCTION FIRST, BROAD CONTAINER LAST. Compound department
+# names pair a function with a container word ("People Operations", "Revenue
+# Operations", "Data Platform"); the function is the persona-bearing half, so its
+# rule must precede the container's. Concretely: the broad "operations"/"ops"
+# rule is last (so "<Function> Operations" maps to <Function>, and only a bare
+# "Operations"/"COO" reaches it), and "data" precedes engineering (so "Data
+# Platform" reads as data, not engineering's "platform"). The remaining function
+# rules are mutually exclusive on realistic inputs, so their relative order is
+# immaterial.
+_PERSONA_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pat, re.IGNORECASE), persona)
+    for pat, persona in (
+        (
+            r"chief financial officer|\bCFO\b|finance|controller|accounting|FP&A",
+            "CFO / VP Finance",
+        ),
+        (
+            r"chief revenue officer|\bCRO\b|revenue|\bsales\b|go-to-market|\bGTM\b",
+            "CRO / VP Sales",
+        ),
+        (
+            r"chief marketing officer|\bCMO\b|marketing|growth|\bbrand\b",
+            "CMO / VP Marketing",
+        ),
+        (r"chief product officer|\bCPO\b|\bproduct\b", "VP Product / Head of Product"),
+        (
+            r"\bpeople\b|\bHR\b|human resources|talent|recruiting",
+            "VP People / Head of HR",
+        ),
+        (
+            r"chief information security officer|\bCISO\b|security",
+            "CISO / Head of Security",
+        ),
+        # Before engineering so "Data Platform" reads as data, not "platform".
+        (r"\bdata\b|machine learning|\bML\b|analytics", "VP Data / Head of Data"),
+        (
+            r"chief technology officer|\bCTO\b|engineering|\bplatform\b|infrastructure|software",
+            "VP Engineering / Engineering leader",
+        ),
+        (r"chief executive officer|\bCEO\b|president", "CEO / President"),
+        # Broad container word, matched last: "<Function> Operations" already
+        # resolved to <Function> above; only bare ops / a COO reaches here.
+        (r"chief operating officer|\bCOO\b|operations|\bops\b", "COO / VP Operations"),
+    )
+)
+
+
+def _persona_text(signal: Signal) -> str:
+    """The role/department text on a signal to match persona rules against.
+
+    8-K departures carry the vacated role(s) in ``extracted_facts['roles']``; the
+    ATS signals carry a ``department`` and (for greenfield) a ``posting_title``.
+    We concatenate whatever is present so one matcher serves every source.
+    """
+    facts = signal.extracted_facts
+    parts: list[str] = []
+    roles = facts.get("roles")
+    if isinstance(roles, list):
+        parts.extend(str(r) for r in roles if r)
+    for key in ("department", "posting_title"):
+        value = facts.get(key)
+        if value:
+            parts.append(str(value))
+    return " ".join(parts)
+
+
+def _match_persona(text: str) -> str | None:
+    """First persona whose rule matches `text`, or None if nothing does."""
+    for pattern, persona in _PERSONA_RULES:
+        if pattern.search(text):
+            return persona
+    return None
+
+
+def derive_persona(signals: list[Signal]) -> tuple[str, str | None]:
+    """Derive the target persona from the signals backing an opportunity.
+
+    Returns ``(persona, source_signal_id)``. The source id keeps the choice
+    explainable — the digest can cite which signal set the persona — and is None
+    when no signal named a usable role/department (funding-only opportunities),
+    in which case the persona falls back to ``DEFAULT_PERSONA``.
+
+    Deterministic and table-driven (no LLM): we walk the persona-bearing signal
+    types in priority order (vacuum > surge > greenfield) and, within a type, the
+    strongest signal first, returning the first persona a rule matches.
+    """
+    by_type: dict[str, list[Signal]] = {}
+    for s in signals:
+        by_type.setdefault(s.signal_type, []).append(s)
+
+    for signal_type in _PERSONA_SIGNAL_PRIORITY:
+        for signal in sorted(
+            by_type.get(signal_type, []), key=lambda s: s.strength, reverse=True
+        ):
+            persona = _match_persona(_persona_text(signal))
+            if persona is not None:
+                return persona, signal.id
+    return DEFAULT_PERSONA, None
 
 
 @dataclass(frozen=True)
@@ -198,16 +316,31 @@ def score_company(
     )
 
 
-def _why_now(breakdown: ScoreBreakdown) -> str:
-    """Human-readable 'why now' built from the components that actually fired."""
+def _why_now(
+    breakdown: ScoreBreakdown,
+    *,
+    persona: str,
+    persona_source: str | None = None,
+) -> str:
+    """Human-readable 'why now' built from the components that actually fired.
+
+    When a specific signal drove the target persona, name it (and the persona)
+    so the digest can explain *why this role* — keeping the persona as cited as
+    the score itself.
+    """
     parts: list[str] = []
     for c in breakdown.components:
         if c.raw <= 0 or not c.signal_ids:
             continue
         parts.append(f"{c.note} ({c.raw:.0%}, weight {c.weight:.0%})")
-    if not parts:
-        return "No active signals; ranked on baseline fit only."
-    return "Concurrent signals: " + "; ".join(parts) + "."
+    base = (
+        "Concurrent signals: " + "; ".join(parts) + "."
+        if parts
+        else "No active signals; ranked on baseline fit only."
+    )
+    if persona_source is not None:
+        base += f" Persona '{persona}' inferred from signal {persona_source}."
+    return base
 
 
 def build_opportunity(
@@ -221,13 +354,26 @@ def build_opportunity(
 
     Requires at least one supporting signal (the schema enforces this); callers
     should filter out zero-signal companies before building.
-    """
-    persona = target_persona or DEFAULT_PERSONA
 
+    When `target_persona` is None the persona is *derived* from the signals that
+    actually scored the opportunity (`derive_persona`) rather than hardcoded — a
+    CFO departure targets a finance leader, an Engineering surge targets an
+    engineering leader — and the signal that set it is named in `why_now` so the
+    choice stays explainable. An explicit `target_persona` always wins.
+    """
     # Confidence: how sure we are the signals are real — take the strongest
     # supporting signal's confidence (they're independent observations).
     supporting = [s for s in signals if s.id in set(breakdown.supporting_signal_ids)]
     confidence = round(max((s.confidence for s in supporting), default=0.0), 3)
+
+    # Derive the persona from the cited supporting signals only, so the choice is
+    # traceable to a signal that actually scored this opportunity. An explicit
+    # override skips derivation (and its provenance clause).
+    persona_source: str | None = None
+    if target_persona is not None:
+        persona = target_persona
+    else:
+        persona, persona_source = derive_persona(supporting)
 
     # Urgency: a leadership vacuum on a fresh filing is the time-critical case.
     vacuum = breakdown.component("leadership_vacuum").raw
@@ -245,7 +391,7 @@ def build_opportunity(
         confidence=confidence,
         urgency=urgency,
         fit_score=fit_score,
-        why_now=_why_now(breakdown),
+        why_now=_why_now(breakdown, persona=persona, persona_source=persona_source),
         recommended_next_action=(
             "Warm intro to the CEO/board citing the funding and the open seat; "
             "position as a pre-search candidate before the role is posted."

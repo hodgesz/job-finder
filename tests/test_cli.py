@@ -81,6 +81,27 @@ def test_demo_northwind_is_funding_plus_vacuum():
     assert "Form D capital raised" in northwind.why_now
 
 
+def test_demo_personas_differ_by_signal():
+    # The headline proof of the persona-driven scorer: Northwind's CFO departure
+    # targets a finance leader, while Helix's Engineering surge (no SEC filing)
+    # targets an engineering leader — not the old hardcoded finance persona.
+    opps = _run(_demo_companies())
+    by_id = {o.company_id: o for o in opps}
+    assert by_id["co-northwind"].target_persona == "CFO / VP Finance"
+    assert by_id["co-helix"].target_persona == "VP Engineering / Engineering leader"
+    # Atlas (CFO stepped down) is also finance; Lumen (funding only) falls back.
+    assert by_id["co-atlas"].target_persona == "CFO / VP Finance"
+    assert by_id["co-lumen"].target_persona == "CFO / VP Finance"
+
+
+def test_demo_render_shows_distinct_personas():
+    out = render(_run(_demo_companies()), _demo_companies(), top=5)
+    assert "Target: VP Engineering / Engineering leader" in out
+    assert "Target: CFO / VP Finance" in out
+    # Header no longer claims a single fixed persona.
+    assert "a senior role may be forming" in out
+
+
 def test_render_includes_evidence_and_why_now():
     opps = _run(_demo_companies())
     out = render(opps, _demo_companies(), top=5)
