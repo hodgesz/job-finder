@@ -36,6 +36,7 @@ from jobfinder.schemas import Opportunity
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD, RelatedPerson
+from jobfinder.sources.firmographics import firmographics_from_sec
 from jobfinder.store import PersistResult, Store
 
 # A fixed "now" so the demo's recency scores are reproducible.
@@ -244,19 +245,55 @@ def _demo_companies() -> list[CompanyInputs]:
 def _live_companies(client: EdgarClient, ciks: list[str]) -> list[CompanyInputs]:
     companies: list[CompanyInputs] = []
     for cik in ciks:
+        # One fetch of the submissions index serves all three needs (filer info,
+        # 8-K and Form D filing lists), so a live CIK makes a single request to
+        # SEC's rate-limited endpoint rather than three identical ones.
+        info, filings = client.company_submissions(cik)
         eight_k = [
-            (f, client.fetch_document(f)) for f in client.recent_8k(cik, item="5.02")
+            (f, client.fetch_document(f))
+            for f in client.recent_8k(cik, item="5.02", filings=filings)
         ]
-        form_d = [(f, client.fetch_form_d(f)) for f in client.recent_form_d(cik)]
+        form_d = [
+            (f, client.fetch_form_d(f))
+            for f in client.recent_form_d(cik, filings=filings)
+        ]
+        # Derive firmographics from data we just fetched: the filer's SIC sector
+        # (from the submissions header), falling back to a Form D industry group.
+        # Funding stage/headcount aren't in SEC filings, so they stay neutral.
+        firmographics = firmographics_from_sec(info, form_d=[fd for _, fd in form_d])
         companies.append(
             CompanyInputs(
                 company_id=f"cik-{cik}",
-                name=f"CIK {cik}",
+                # Prefer the real entity name from the index over a "CIK <n>" stub.
+                name=info.name or f"CIK {cik}",
                 eight_k=eight_k,
                 form_d=form_d,
+                firmographics=firmographics,
             )
         )
     return companies
+
+
+def _profile_from_args(args: argparse.Namespace) -> CandidateProfile | None:
+    """Build a CandidateProfile from the live `--target-*`/`--*-employees` flags.
+
+    Returns None when the user supplied none of them, so live mode keeps the
+    pre-Slice-9 behaviour (the literal neutral company_fit) unless a profile is
+    actually requested.
+    """
+    if not (
+        args.target_sector
+        or args.target_stage
+        or args.min_employees is not None
+        or args.max_employees is not None
+    ):
+        return None
+    return CandidateProfile(
+        target_sectors=tuple(args.target_sector),
+        target_stages=tuple(args.target_stage),
+        min_employees=args.min_employees,
+        max_employees=args.max_employees,
+    )
 
 
 def _parse_ats_spec(spec: str) -> tuple[str, str]:
@@ -409,6 +446,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Contact User-Agent, e.g. 'job-finder you@example.com' (SEC requires "
         "a contact email when fetching filings).",
     )
+    # Candidate profile: drives the derived company_fit. Sectors are scored
+    # against the firmographics derived from the SEC filings (the SIC sector).
+    # Stage/size are accepted but cannot influence the live SCORE yet: SEC
+    # filings disclose neither, so those firmographic fields are None and score
+    # neutral (the fit model never penalises a dimension it can't see). They will
+    # engage once a richer enrichment source populates those fields. Omit all of
+    # these and fit falls back to the neutral literal (the pre-Slice-9 behaviour).
+    live.add_argument(
+        "--target-sector",
+        action="append",
+        default=[],
+        metavar="SECTOR",
+        help="A sector the candidate targets (repeatable), e.g. 'robotics'. "
+        "Matched whole-word against each company's derived SIC sector.",
+    )
+    live.add_argument(
+        "--target-stage",
+        action="append",
+        default=[],
+        metavar="STAGE",
+        help="A funding stage the candidate targets (repeatable), e.g. "
+        "'series_b'. SEC filings carry no funding stage, so this scores neutral "
+        "until stage enrichment lands.",
+    )
+    live.add_argument(
+        "--min-employees",
+        type=int,
+        default=None,
+        help="Lower bound of the target headcount band. SEC filings carry no "
+        "headcount, so this scores neutral until headcount enrichment lands.",
+    )
+    live.add_argument(
+        "--max-employees",
+        type=int,
+        default=None,
+        help="Upper bound of the target headcount band. SEC filings carry no "
+        "headcount, so this scores neutral until headcount enrichment lands.",
+    )
 
     report = sub.add_parser(
         "report",
@@ -476,7 +551,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.ats:
             ats = AtsClient.with_user_agent(args.user_agent)
             companies.extend(_ats_companies(ats, args.ats))
-        result = run_pipeline_detailed(companies)
+        # A candidate profile (if any --target-* flags were given) turns each
+        # company's derived firmographics into a real company_fit; without one,
+        # fit stays the neutral literal.
+        result = run_pipeline_detailed(
+            companies, candidate_profile=_profile_from_args(args)
+        )
     else:  # pragma: no cover - argparse enforces a valid command
         return 2
 

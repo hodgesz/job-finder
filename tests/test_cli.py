@@ -1,22 +1,27 @@
 """Tests for the pipeline wiring and the CLI demo (offline)."""
 
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 from jobfinder.cli import (
     _DEMO_PROFILE,
     _demo_companies,
+    _live_companies,
     _parse_since,
+    _profile_from_args,
     _store_url,
     build_parser,
     main,
     render,
 )
+from jobfinder.fit import CandidateProfile
 from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detailed
 from jobfinder.signals.extraction import RegexExtractor
-from jobfinder.sources.edgar import Filing, FormD
+from jobfinder.sources.edgar import EdgarClient, Filing, FormD
 from jobfinder.store import Store
 
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _run(companies):
@@ -347,3 +352,108 @@ def test_live_requires_user_agent():
         assert exc.code == 2
     else:  # pragma: no cover
         raise AssertionError("expected SystemExit for missing --user-agent")
+
+
+# --------------------------------------------------------------------------- #
+# Slice 9: live firmographics derivation + candidate-profile flags.
+# --------------------------------------------------------------------------- #
+def _edgar_fetcher(url: str) -> str:
+    """Route the two URL shapes the live SEC path hits to fixtures, fully
+    offline: the submissions index (used for both filings and company_info) and
+    any primary document."""
+    if "/submissions/" in url:
+        return (FIXTURES / "submissions_sample.json").read_text()
+    return (FIXTURES / "8k_item502_apple.txt").read_text()
+
+
+def test_live_company_derives_firmographics_and_real_name():
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"])
+    assert len(companies) == 1
+    company = companies[0]
+    # The real entity name from the index replaces the "CIK <n>" stub.
+    assert company.name == "Apple Inc."
+    # Firmographics are derived from the filer's SIC sector (no extra fetch).
+    assert company.firmographics is not None
+    assert company.firmographics.sector == "Electronic Computers"
+    # SEC discloses neither, so they stay neutral-by-omission.
+    assert company.firmographics.funding_stage is None
+    assert company.firmographics.employee_count is None
+
+
+def test_live_company_fit_uses_derived_sector():
+    # End to end: a profile whose target sector matches the derived SIC sector
+    # lifts company_fit above the neutral 0.5; a non-matching sector pulls it
+    # below — proving live runs no longer get the flat placeholder.
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"])
+
+    match = run_pipeline(
+        companies,
+        candidate_profile=CandidateProfile(target_sectors=("electronic",)),
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
+    miss = run_pipeline(
+        companies,
+        candidate_profile=CandidateProfile(target_sectors=("biotechnology",)),
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
+    assert match[0].fit_score > 0.5 > miss[0].fit_score
+    assert "Electronic Computers matches target sector" in match[0].why_now
+
+
+def test_profile_from_args_none_when_no_flags():
+    args = build_parser().parse_args(
+        ["live", "--cik", "320193", "--user-agent", "jf you@example.com"]
+    )
+    # No --target-* flags -> no profile -> live fit keeps the neutral literal.
+    assert _profile_from_args(args) is None
+
+
+def test_profile_from_args_builds_from_flags():
+    args = build_parser().parse_args(
+        [
+            "live",
+            "--cik",
+            "320193",
+            "--user-agent",
+            "jf you@example.com",
+            "--target-sector",
+            "robotics",
+            "--target-sector",
+            "logistics",
+            "--target-stage",
+            "series_b",
+            "--min-employees",
+            "50",
+            "--max-employees",
+            "300",
+        ]
+    )
+    profile = _profile_from_args(args)
+    assert profile is not None
+    assert profile.target_sectors == ("robotics", "logistics")
+    assert profile.target_stages == ("series_b",)
+    assert profile.min_employees == 50
+    assert profile.max_employees == 300
+
+
+def test_profile_from_args_size_only():
+    # A single size bound is enough to request a profile (its presence, not just
+    # the sector flags, must trigger derivation).
+    args = build_parser().parse_args(
+        [
+            "live",
+            "--cik",
+            "320193",
+            "--user-agent",
+            "jf you@example.com",
+            "--min-employees",
+            "10",
+        ]
+    )
+    profile = _profile_from_args(args)
+    assert profile is not None
+    assert profile.min_employees == 10

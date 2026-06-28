@@ -119,6 +119,13 @@ uv run python main.py
 uv run python -m jobfinder.cli demo
 # `live` fetches real EDGAR filings (SEC requires a contact User-Agent):
 uv run python -m jobfinder.cli live --cik 320193 --user-agent "job-finder you@example.com"
+# Add a candidate profile to derive a real company_fit: target sectors are
+# matched against each filer's SIC sector (from the same submissions fetch).
+# (Stage/headcount flags exist but score neutral until richer enrichment lands,
+# since SEC filings disclose neither.)
+uv run python -m jobfinder.cli live --cik 320193 \
+  --user-agent "job-finder you@example.com" \
+  --target-sector "electronic" --target-sector "software"
 
 # Persist a run so history accumulates (--db takes a SQLite path or any
 # SQLAlchemy URL; re-runs upsert by id rather than duplicating):
@@ -160,7 +167,8 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] First A2A extraction: 8-K specialist as a LangGraph service behind `to_a2a()`, consumed by an ADK + Gemini `RemoteA2aAgent` orchestrator
 - [x] Pillar I: ATS collectors (Greenhouse / Lever / Ashby) — hiring-velocity / department-surge / greenfield-team signals, activating the `hiring_velocity` + `strategic_language` scorer components
 - [x] Reporter (cross-run digest) — `report --db [--since]` turns accumulated runs into a prioritized "what changed since last week" view (new vs recurring, score movement, newly-appeared signals)
-- [ ] Enrichment integrations (contacts, firmographics)
+- [x] Firmographic `company_fit`: a candidate-vs-company fit model (`jobfinder.fit`), wired into live runs by deriving each filer's sector from its SEC SIC classification (`live --target-sector`)
+- [ ] Enrichment integrations (contacts, richer firmographics — funding stage, headcount)
 
 ## Legal & ethical use
 
