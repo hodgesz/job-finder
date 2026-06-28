@@ -18,9 +18,12 @@ So this module:
   4. Classifies successor_present vs. successor_missing.
   5. Emits a `Signal` (8k_exec_departure / 8k_exec_appointment) with evidence.
 
-Parsing is deliberately conservative keyword/heuristic matching, not an LLM
-call: it is deterministic, testable, and cheap. An LLM extraction pass can be
-layered on later for officer-name/role precision.
+`parse_item_502` is deliberately conservative keyword/heuristic matching: it
+is deterministic, testable, and cheap, and serves as both a pre-filter and an
+offline fallback. `signals_from_filing` routes classification through
+`jobfinder.signals.extraction.extract_events`, which prefers a structured LLM
+pass (better at dense filing prose) and degrades to this regex parser when no
+LLM is configured or a call fails.
 """
 
 from __future__ import annotations
@@ -179,15 +182,30 @@ def signals_from_filing(
     *,
     company_id: str,
     observed_at: datetime | None = None,
+    extractor=None,
 ) -> list[Signal]:
     """Produce Signal(s) from one 8-K filing + its document text.
+
+    Event classification goes through `extract_events`, which prefers an LLM
+    extractor (better at filing prose) and falls back to the deterministic
+    regex parser when no LLM is available. Pass `extractor` to inject one;
+    otherwise it is resolved from the environment (GEMINI_API_KEY) or the
+    regex fallback.
 
     Returns an empty list if the filing does not disclose Item 5.02 or has no
     detectable executive event.
     """
+    # Cheap pre-filter: only filings whose index discloses 5.02 reach the
+    # (possibly LLM-backed) extractor. The `items` field is authoritative.
     item_known = ITEM_502 in filing.items
-    events = parse_item_502(document, item_known=item_known)
-    if not events.has_item_502 or not (events.has_departure or events.has_appointment):
+    if not item_known and not _ITEM_502_LABEL_RE.search(strip_html(document)):
+        return []
+
+    # Lazy import avoids a circular dependency (extraction imports this module).
+    from jobfinder.signals.extraction import extract_events
+
+    events = extract_events(document, extractor=extractor, item_known=item_known)
+    if not (events.has_departure or events.has_appointment):
         return []
 
     observed = observed_at or _utcnow()
@@ -205,13 +223,38 @@ def signals_from_filing(
             retrieved_at=observed,
         )
     ]
-    roles_str = (
-        ", ".join(events.roles) if events.roles else "unspecified officer/director"
-    )
+    # LLM extraction is higher-confidence than blunt regex matching.
+    confidence = 0.9 if events.extraction_method == "llm" else 0.8
+
+    def _facts(event_type: str) -> dict:
+        matching = [e for e in events.events if e.event_type == event_type]
+        return {
+            "officers": [
+                {
+                    "name": e.officer_name,
+                    "role": e.role,
+                    "effective_date": e.effective_date,
+                }
+                for e in matching
+            ],
+            "roles": [e.role for e in matching if e.role],
+            "extraction_method": events.extraction_method,
+            "items": filing.items,
+        }
+
+    def _roles_str(event_type: str) -> str:
+        roles = [e.role for e in events.events if e.event_type == event_type and e.role]
+        return (
+            ", ".join(dict.fromkeys(roles)) if roles else "unspecified officer/director"
+        )
 
     signals: list[Signal] = []
     if events.has_departure:
         vacuum = events.is_leadership_vacuum
+        facts = _facts("departure")
+        facts.update(
+            {"successor_named": events.successor_named, "leadership_vacuum": vacuum}
+        )
         signals.append(
             Signal(
                 id=f"{filing.accession_number}:departure",
@@ -220,7 +263,7 @@ def signals_from_filing(
                 source="sec_edgar",
                 observed_at=observed,
                 effective_at=effective,
-                title=f"8-K Item 5.02 executive departure ({roles_str})",
+                title=f"8-K Item 5.02 executive departure ({_roles_str('departure')})",
                 summary=(
                     "Item 5.02 discloses an executive departure "
                     + (
@@ -230,14 +273,9 @@ def signals_from_filing(
                         else "alongside a named successor."
                     )
                 ),
-                extracted_facts={
-                    "roles": events.roles,
-                    "successor_present": events.successor_present,
-                    "leadership_vacuum": vacuum,
-                    "items": filing.items,
-                },
+                extracted_facts=facts,
                 evidence=evidence,
-                confidence=0.8,
+                confidence=confidence,
                 # A vacuum is the higher-value signal; weight strength accordingly.
                 strength=0.75 if vacuum else 0.4,
             )
@@ -251,11 +289,11 @@ def signals_from_filing(
                 source="sec_edgar",
                 observed_at=observed,
                 effective_at=effective,
-                title=f"8-K Item 5.02 executive appointment ({roles_str})",
+                title=f"8-K Item 5.02 executive appointment ({_roles_str('appointment')})",
                 summary="Item 5.02 discloses an executive appointment/election.",
-                extracted_facts={"roles": events.roles, "items": filing.items},
+                extracted_facts=_facts("appointment"),
                 evidence=evidence,
-                confidence=0.8,
+                confidence=confidence,
                 strength=0.5,
             )
         )
