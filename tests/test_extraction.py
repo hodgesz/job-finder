@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 from jobfinder.signals.extraction import (
     ExecEvent,
     ExtractedEvents,
+    RegexExtractor,
     extract_events,
     regex_fallback,
 )
@@ -76,6 +77,18 @@ def test_extractor_failure_falls_back_to_regex():
     assert result.extraction_method == "regex_fallback"
     assert result.has_departure
     assert result.is_leadership_vacuum
+
+
+def test_regex_extractor_forces_deterministic_path():
+    # RegexExtractor short-circuits the LLM even if one were configured, so a
+    # caller (e.g. the CLI demo) gets reproducible, offline output.
+    result = RegexExtractor().extract(VACUUM_DOC)
+    assert result.extraction_method == "regex_fallback"
+    assert result.has_departure
+    assert result.is_leadership_vacuum
+    # And injected into extract_events, it is used verbatim (no env lookup).
+    via = extract_events(VACUUM_DOC, extractor=RegexExtractor())
+    assert via.extraction_method == "regex_fallback"
 
 
 def test_regex_fallback_maps_parser_output():
