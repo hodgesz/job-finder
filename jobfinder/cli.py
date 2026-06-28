@@ -1,9 +1,11 @@
 """job-finder CLI — Slice 2 demo (plan section 12).
 
-Produces the headline deliverable: *"top N companies where a CFO / VP-Finance
-role may be forming, with why-now + evidence"*, by wiring 8-K leadership-vacuum
-signals and Form D funding signals through the weighted scorer into ranked
-`Opportunity` objects.
+Produces the headline deliverable: *"top N companies where a senior role may be
+forming, with why-now + evidence"*, by wiring 8-K leadership-vacuum signals,
+Form D funding signals and ATS hiring-pattern signals through the weighted
+scorer into ranked `Opportunity` objects. Each opportunity's target persona is
+derived from its own signals (a CFO departure → a finance leader; an Engineering
+surge → an engineering leader), not fixed system-wide.
 
 Two modes:
 
@@ -269,7 +271,11 @@ def render(
     """Render ranked opportunities as a human-readable report."""
     names = {c.company_id: (c.name or c.company_id) for c in companies}
     lines: list[str] = []
-    header = f"Top {min(top, len(opportunities))} companies where a CFO / VP-Finance role may be forming"
+    # The target persona is now derived per-opportunity from its signals (an
+    # Engineering surge reads as an engineering leader, a CFO departure as a
+    # finance leader), so the header no longer claims a single fixed persona —
+    # each row prints its own under "Target:".
+    header = f"Top {min(top, len(opportunities))} companies where a senior role may be forming"
     lines.append(header)
     lines.append("=" * len(header))
     if not opportunities:

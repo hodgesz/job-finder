@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 import pytest
 
 from jobfinder.scoring import (
+    DEFAULT_PERSONA,
     WEIGHTS,
     build_opportunity,
+    derive_persona,
     rank_opportunities,
     score_company,
 )
@@ -146,6 +148,222 @@ def test_build_opportunity_cites_signals_and_sets_persona():
     assert "Concurrent signals" in opp.why_now
     assert 0.0 <= opp.score <= 1.0
     assert opp.urgency > 0  # vacuum + fresh signal drives urgency
+
+
+def test_derive_persona_from_cfo_departure():
+    vacuum = _signal(
+        "s-vac",
+        "8k_exec_departure",
+        strength=0.75,
+        facts={"leadership_vacuum": True, "roles": ["Chief Financial Officer"]},
+    )
+    persona, source = derive_persona([vacuum])
+    assert persona == "CFO / VP Finance"
+    assert source == "s-vac"  # traceable to the signal that set it
+
+
+def test_derive_persona_from_engineering_surge():
+    surge = _signal(
+        "s-eng",
+        "department_surge",
+        strength=0.8,
+        facts={"department": "Engineering"},
+    )
+    persona, source = derive_persona([surge])
+    assert persona == "VP Engineering / Engineering leader"
+    assert source == "s-eng"
+
+
+def test_derive_persona_from_greenfield_posting_title():
+    greenfield = _signal(
+        "s-gf",
+        "greenfield_team",
+        strength=0.8,
+        facts={"posting_title": "Founding Product Manager", "department": None},
+    )
+    persona, source = derive_persona([greenfield])
+    assert persona == "VP Product / Head of Product"
+    assert source == "s-gf"
+
+
+def test_derive_persona_funding_only_falls_back_to_default():
+    # Funding carries no role of its own -> default persona, and no source id so
+    # build_opportunity omits the provenance clause.
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    persona, source = derive_persona([funding])
+    assert persona == DEFAULT_PERSONA
+    assert source is None
+
+
+def test_derive_persona_unrecognized_role_falls_back_to_default():
+    # A persona-bearing signal whose role matches no rule still falls back rather
+    # than guessing -> default persona, no source.
+    surge = _signal(
+        "s-misc",
+        "department_surge",
+        strength=0.8,
+        facts={"department": "Facilities"},
+    )
+    persona, source = derive_persona([surge])
+    assert persona == DEFAULT_PERSONA
+    assert source is None
+
+
+@pytest.mark.parametrize(
+    ("department", "expected"),
+    [
+        # Compound "<function> Operations" names resolve to the function, not the
+        # broad operations/COO catch-all (which is matched last).
+        ("People Operations", "VP People / Head of HR"),
+        ("Revenue Operations", "CRO / VP Sales"),
+        ("Sales Operations", "CRO / VP Sales"),
+        ("Marketing Operations", "CMO / VP Marketing"),
+        # "Data Platform" reads as data, not engineering's "platform" token.
+        ("Data Platform", "VP Data / Head of Data"),
+        # "Product Marketing" (PMM) is a marketing function, not product.
+        ("Product Marketing", "CMO / VP Marketing"),
+        # A bare container word still reaches the operations rule.
+        ("Operations", "COO / VP Operations"),
+    ],
+)
+def test_derive_persona_compound_department_names(department, expected):
+    surge = _signal(
+        "s-dept", "department_surge", strength=0.8, facts={"department": department}
+    )
+    persona, source = derive_persona([surge])
+    assert persona == expected
+    assert source == "s-dept"
+
+
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        # A bare "President" (a CEO-adjacent role) maps to CEO/President...
+        ("President", "CEO / President"),
+        ("President and CEO", "CEO / President"),
+        # ...but a *Vice* President does not — the unbounded "president" token
+        # must not swallow VP titles into the CEO persona.
+        ("Vice President of Corporate Development", DEFAULT_PERSONA),
+        ("Executive Vice President", DEFAULT_PERSONA),
+    ],
+)
+def test_derive_persona_vice_president_is_not_ceo(role, expected):
+    # Drive it via an 8-K departure whose extracted role text is the title; no
+    # earlier function word (sales/eng/etc.) so it would otherwise reach the CEO
+    # rule's "president" token.
+    sig = _signal(
+        "s-vp",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": [role]},
+    )
+    persona, _ = derive_persona([sig])
+    assert persona == expected
+
+
+def test_derive_persona_multi_role_follows_listed_order_not_table_order():
+    # One 8-K disclosing two departures: CTO listed first, CFO second. The
+    # primary (first-listed) role must drive the persona, even though the finance
+    # rule sits earlier in _PERSONA_RULES than the engineering rule.
+    sig = _signal(
+        "s-multi",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": ["CTO", "CFO"]},
+    )
+    persona, source = derive_persona([sig])
+    assert persona == "VP Engineering / Engineering leader"
+    assert source == "s-multi"
+    # And the reverse listing yields the finance persona.
+    sig_rev = _signal(
+        "s-multi-rev",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": ["CFO", "CTO"]},
+    )
+    persona_rev, _ = derive_persona([sig_rev])
+    assert persona_rev == "CFO / VP Finance"
+
+
+def test_derive_persona_vacuum_wins_over_surge():
+    # A CFO departure (a confirmed open seat) outranks a concurrent Engineering
+    # build-out as the persona source, regardless of signal strength.
+    vacuum = _signal(
+        "s-vac",
+        "8k_exec_departure",
+        strength=0.4,  # weaker than the surge
+        facts={"leadership_vacuum": True, "roles": ["CFO"]},
+    )
+    surge = _signal(
+        "s-eng",
+        "department_surge",
+        strength=0.95,
+        facts={"department": "Engineering"},
+    )
+    persona, source = derive_persona([surge, vacuum])
+    assert persona == "CFO / VP Finance"
+    assert source == "s-vac"
+
+
+def test_derive_persona_strongest_signal_within_a_type_wins():
+    weak = _signal(
+        "s-weak", "department_surge", strength=0.4, facts={"department": "Sales"}
+    )
+    strong = _signal(
+        "s-strong",
+        "department_surge",
+        strength=0.9,
+        facts={"department": "Engineering"},
+    )
+    persona, source = derive_persona([weak, strong])
+    assert persona == "VP Engineering / Engineering leader"
+    assert source == "s-strong"
+
+
+def test_build_opportunity_explicit_persona_overrides_derivation():
+    # An explicit override wins and skips the inferred-from-signal provenance.
+    surge = _signal(
+        "s-eng", "department_surge", strength=0.8, facts={"department": "Engineering"}
+    )
+    breakdown = score_company("co-1", [surge], now=NOW)
+    opp = build_opportunity(breakdown, signals=[surge], target_persona="Board Member")
+    assert opp.target_persona == "Board Member"
+    assert "inferred from signal" not in opp.why_now
+
+
+def test_build_opportunity_names_persona_source_in_why_now():
+    surge = _signal(
+        "s-eng", "department_surge", strength=0.8, facts={"department": "Engineering"}
+    )
+    breakdown = score_company("co-1", [surge], now=NOW)
+    opp = build_opportunity(breakdown, signals=[surge])
+    assert opp.target_persona == "VP Engineering / Engineering leader"
+    # Explainable: the why-now cites which signal drove the persona.
+    assert "inferred from signal s-eng" in opp.why_now
+
+
+def test_build_opportunity_funding_only_uses_default_without_source_clause():
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    breakdown = score_company("co-1", [funding], now=NOW)
+    opp = build_opportunity(breakdown, signals=[funding])
+    assert opp.target_persona == DEFAULT_PERSONA
+    assert "inferred from signal" not in opp.why_now
+
+
+def test_build_opportunity_derives_persona_from_cited_signals_only():
+    # An engineering surge for a DIFFERENT company is not among this breakdown's
+    # supporting ids, so it must not leak into the persona derivation.
+    funding = _signal("s-fund", "form_d_funding", strength=0.9)
+    breakdown = score_company("co-1", [funding], now=NOW)
+    foreign = _signal(
+        "s-foreign",
+        "department_surge",
+        strength=0.9,
+        facts={"department": "Engineering"},
+    )
+    opp = build_opportunity(breakdown, signals=[funding, foreign])
+    # Only the funding signal is cited -> default persona, foreign signal ignored.
+    assert opp.target_persona == DEFAULT_PERSONA
 
 
 def test_rank_orders_companies_best_first_and_skips_empty():
