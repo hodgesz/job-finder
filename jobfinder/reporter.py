@@ -42,28 +42,35 @@ def _age_phrase(when: datetime, now: datetime) -> str:
     return f"{int(days)} days ago"
 
 
-def _movement_tag(change: OpportunityChange) -> str:
-    """A short ``[NEW]`` / ``[↑ +0.07]`` / ``[recurring]`` tag for one row.
+def _movement_tag(change: OpportunityChange, *, has_window: bool) -> str:
+    """A short ``[NEW]`` / ``[↑ +0.07]`` / ``[updated]`` / ``[recurring]`` tag.
 
-    A row that was re-saved this window but whose score is unchanged at display
-    precision reads ``[updated]`` rather than ``[recurring]`` so a stale prior
-    delta isn't shown as movement; a never-touched row stays ``[recurring]``.
+    ``previous_score`` records movement on the *last* upsert only. In a
+    "what changed since <date>" report (``has_window``) that delta is only
+    honest if the row was actually (re)saved within the window — otherwise the
+    movement predates the cutoff, so an untouched row reads ``[recurring]`` even
+    if its stored prior score differs. In the plain standings view (no window)
+    there is no cutoff to mislead about, so the last-upsert delta is shown
+    directly. A sub-display-precision delta is rounded to the displayed 2dp
+    before the zero check so it can't render a self-contradictory ``[↑ +0.00]``.
     """
     if change.is_new:
         return "[NEW]"
     delta = change.score_delta
-    # Round to the SAME precision we display at before deciding "no movement",
-    # so a sub-0.005 delta can't render the self-contradictory "[↑ +0.00]".
-    if delta is not None and round(delta, 2) != 0:
+    moved = delta is not None and round(delta, 2) != 0
+    if has_window and not change.changed_in_window:
+        # Untouched this window: any stored delta happened before the cutoff.
+        return "[recurring]"
+    if moved:
         arrow = "↑" if delta > 0 else "↓"
         return f"[{arrow} {delta:+.2f}]"
-    if change.changed_in_window:
-        return "[updated]"
-    return "[recurring]"
+    # Touched this window with no real movement reads [updated]; in the
+    # window-less standings view an unmoved row is simply [recurring].
+    return "[updated]" if has_window else "[recurring]"
 
 
 def _render_opportunity(
-    rank: int, change: OpportunityChange, now: datetime
+    rank: int, change: OpportunityChange, now: datetime, *, has_window: bool
 ) -> list[str]:
     """One ranked opportunity block, mirroring ``cli.render``'s style plus the
     cross-run annotations."""
@@ -71,7 +78,7 @@ def _render_opportunity(
     lines = [
         f"{rank}. {opp.company_id}  —  score {opp.score:.2f}  "
         f"(confidence {opp.confidence:.0%}, urgency {opp.urgency:.0%})  "
-        f"{_movement_tag(change)}",
+        f"{_movement_tag(change, has_window=has_window)}",
         f"   Target: {opp.target_persona}",
         f"   Why now: {opp.why_now}",
         f"   Next: {opp.recommended_next_action}",
@@ -115,11 +122,12 @@ def render_digest(
     it degrades to a plain ranked standings digest. ``now`` is injected so the
     relative ages ("3 days ago") are reproducible.
     """
+    has_window = diff.since is not None
     opportunities = diff.opportunities
     shown = opportunities if top is None else opportunities[:top]
 
     lines: list[str] = []
-    if diff.since is not None:
+    if has_window:
         header = (
             f"Opportunity digest — what changed since {diff.since.date().isoformat()}"
         )
@@ -133,15 +141,20 @@ def render_digest(
         lines.append("No opportunities on file.")
         return "\n".join(lines)
 
-    new_count = sum(1 for c in opportunities if c.is_new)
-    lines.append(
-        f"{len(opportunities)} opportunities on file "
-        f"({new_count} new this window); showing {len(shown)}."
-    )
+    # The "new this window" count and the newly-appeared-signals section only
+    # mean anything when there is a cutoff to be new *relative to*; without
+    # --since this is a plain ranked standings view.
+    count_line = f"{len(opportunities)} opportunities on file"
+    if has_window:
+        new_count = sum(1 for c in opportunities if c.is_new)
+        count_line += f" ({new_count} new this window)"
+    count_line += f"; showing {len(shown)}."
+    lines.append(count_line)
 
     for rank, change in enumerate(shown, start=1):
         lines.append("")
-        lines.extend(_render_opportunity(rank, change, now))
+        lines.extend(_render_opportunity(rank, change, now, has_window=has_window))
 
-    lines.extend(_render_new_signals(diff.new_signals, now))
+    if has_window:
+        lines.extend(_render_new_signals(diff.new_signals, now))
     return "\n".join(lines)

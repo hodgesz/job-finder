@@ -93,15 +93,6 @@ def test_since_digest_flags_new_and_lists_new_signals():
     assert "https://example.com/8k" in out
 
 
-def test_score_movement_arrow_is_rendered():
-    store = Store.in_memory()
-    store.save_opportunity(_opportunity(score=0.40), now=NOW)
-    store.save_opportunity(_opportunity(score=0.55), now=LATER)
-    out = render_digest(store.diff(), now=RENDER_NOW)
-    # Score rose 0.40 -> 0.55: an up-arrow with the delta.
-    assert "↑ +0.15" in out
-
-
 def test_resaved_without_score_change_reads_updated_not_recurring():
     store = Store.in_memory()
     store.save_opportunity(_opportunity(score=0.50), now=NOW)
@@ -122,6 +113,43 @@ def test_sub_threshold_delta_does_not_render_contradictory_arrow():
     out = render_digest(store.diff(), now=RENDER_NOW)
     assert "+0.00" not in out
     assert "↑" not in out
+
+
+def test_window_digest_hides_movement_that_predates_the_cutoff():
+    """A row whose score moved before the --since cutoff and was NOT re-saved in
+    the window must read [recurring], not a stale [↑] — the digest title only
+    promises changes since the cutoff."""
+    store = Store.in_memory()
+    # Move the score at NOW (0.40 -> 0.55), then never touch it again.
+    store.save_opportunity(
+        _opportunity(score=0.40), now=datetime(2026, 5, 20, tzinfo=timezone.utc)
+    )
+    store.save_opportunity(_opportunity(score=0.55), now=NOW)
+    # Cutoff is AFTER the last save, so nothing changed within the window.
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    out = render_digest(store.diff(since=cutoff), now=RENDER_NOW)
+    assert "[recurring]" in out
+    assert "↑" not in out and "+0.15" not in out
+
+
+def test_standings_digest_omits_window_wording_and_new_signals_section():
+    """Without --since there is no window: no "(N new this window)" and no
+    "Newly appeared signals" section."""
+    store = Store.in_memory()
+    store.persist_run([_signal()], [_opportunity()], now=NOW)
+    out = render_digest(store.diff(), now=RENDER_NOW)
+    assert "this window" not in out
+    assert "Newly appeared signals" not in out
+
+
+def test_standings_digest_shows_last_upsert_movement():
+    """In the window-less standings view the last-upsert delta is shown directly
+    (no cutoff to mislead about)."""
+    store = Store.in_memory()
+    store.save_opportunity(_opportunity(score=0.40), now=NOW)
+    store.save_opportunity(_opportunity(score=0.55), now=LATER)
+    out = render_digest(store.diff(), now=RENDER_NOW)
+    assert "↑ +0.15" in out
 
 
 def test_top_limits_opportunities_but_count_reflects_full_store():
