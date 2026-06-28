@@ -1,0 +1,38 @@
+[
+  {
+    "id": "a1b2c3d4-0001",
+    "text": "Senior Product Designer",
+    "hostedUrl": "https://jobs.lever.co/acme/a1b2c3d4-0001",
+    "createdAt": 1781956980000,
+    "categories": {
+      "department": "Design",
+      "team": "Product Design",
+      "location": "Remote",
+      "commitment": "Full-time"
+    }
+  },
+  {
+    "id": "a1b2c3d4-0002",
+    "text": "Head of Design",
+    "hostedUrl": "https://jobs.lever.co/acme/a1b2c3d4-0002",
+    "createdAt": 1781870580000,
+    "categories": {
+      "department": "Design",
+      "team": "Design Leadership",
+      "location": "New York",
+      "commitment": "Full-time"
+    }
+  },
+  {
+    "id": "a1b2c3d4-0003",
+    "text": "Founding Growth Marketer",
+    "hostedUrl": "https://jobs.lever.co/acme/a1b2c3d4-0003",
+    "createdAt": 1781784180000,
+    "categories": {
+      "department": "Marketing",
+      "team": "Growth",
+      "location": "Remote",
+      "commitment": "Full-time"
+    }
+  }
+]
