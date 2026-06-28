@@ -29,6 +29,7 @@ import argparse
 import sys
 from datetime import date, datetime, timedelta, timezone
 
+from jobfinder.fit import CandidateProfile, Firmographics
 from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detailed
 from jobfinder.reporter import render_digest
 from jobfinder.schemas import Opportunity
@@ -39,6 +40,17 @@ from jobfinder.store import PersistResult, Store
 
 # A fixed "now" so the demo's recency scores are reproducible.
 _DEMO_NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+# The person we're hunting roles for, used by the demo to *derive* each
+# company's fit instead of hand-setting a magic number: a finance/ops leader who
+# wants an early-growth (Series A/B) robotics or industrial company of ~50-300
+# people. The demo firmographics below score against this.
+_DEMO_PROFILE = CandidateProfile(
+    target_sectors=("robotics", "industrial", "logistics"),
+    target_stages=("series_a", "series_b"),
+    min_employees=50,
+    max_employees=300,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +191,13 @@ def _demo_companies() -> list[CompanyInputs]:
         ],
     )
 
+    # Firmographics replace the old hand-set company_fit magic numbers: each
+    # company's fit is now *derived* by scoring these against `_DEMO_PROFILE`
+    # (early-growth robotics/industrial, ~50-300 ppl). Northwind (Series B
+    # robotics, 180) is a perfect match; Atlas (Series A logistics, 240) also
+    # matches on all three; Lumen (Series C biotech, 90) is off-sector with an
+    # adjacent stage; Helix (seed AI, 35) is off-sector — its only saving grace a
+    # near-miss stage/size — so it lands lowest.
     return [
         CompanyInputs(
             company_id="co-northwind",
@@ -186,25 +205,35 @@ def _demo_companies() -> list[CompanyInputs]:
             eight_k=[(northwind_8k, northwind_8k_doc)],
             form_d=[(northwind_form_d_filing, northwind_form_d)],
             ats_boards=[northwind_board],
-            company_fit=0.8,
+            firmographics=Firmographics(
+                sector="Robotics", funding_stage="Series B", employee_count=180
+            ),
         ),
         CompanyInputs(
             company_id="co-lumen",
             name="Lumen Bio Corp.",
             form_d=[(lumen_form_d_filing, lumen_form_d)],
-            company_fit=0.5,
+            firmographics=Firmographics(
+                sector="Biotechnology", funding_stage="Series C", employee_count=90
+            ),
         ),
         CompanyInputs(
             company_id="co-atlas",
             name="Atlas Freight Inc.",
             eight_k=[(atlas_8k, atlas_8k_doc)],
-            company_fit=0.6,
+            firmographics=Firmographics(
+                sector="Logistics", funding_stage="Series A", employee_count=240
+            ),
         ),
         CompanyInputs(
             company_id="co-helix",
             name="Helix Labs",
             ats_boards=[helix_board],
-            company_fit=0.5,
+            firmographics=Firmographics(
+                sector="Artificial Intelligence",
+                funding_stage="Seed",
+                employee_count=35,
+            ),
         ),
     ]
 
@@ -431,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
         # and offline even when a GEMINI_API_KEY is present in the environment.
         result = run_pipeline_detailed(
             companies,
+            candidate_profile=_DEMO_PROFILE,
             observed_at=_DEMO_NOW,
             now=_DEMO_NOW,
             extractor=RegexExtractor(),

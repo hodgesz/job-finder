@@ -16,6 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from jobfinder.fit import CandidateProfile, Firmographics, assess_fit
 from jobfinder.schemas import Opportunity, Signal
 from jobfinder.scoring import rank_opportunities
 from jobfinder.signals.ats_hiring import signals_from_board
@@ -37,6 +38,11 @@ class CompanyInputs:
     form_d: list[tuple[Filing, FormD]] = field(default_factory=list)
     # Public ATS job-board snapshots (Greenhouse/Lever/Ashby).
     ats_boards: list[JobBoard] = field(default_factory=list)
+    # Already-fetched firmographics for the candidate-fit model. When a
+    # CandidateProfile is supplied to the pipeline, these are scored into a
+    # derived company_fit (see `jobfinder.fit`); absent firmographics or no
+    # profile fall back to the literal `company_fit` float below.
+    firmographics: Firmographics | None = None
     company_fit: float = 0.5
 
 
@@ -95,9 +101,25 @@ class PipelineResult:
     opportunities: list[Opportunity] = field(default_factory=list)
 
 
+def _fit_for_company(
+    company: CompanyInputs, profile: CandidateProfile | None
+) -> tuple[float, str | None]:
+    """Resolve one company's (fit_score, fit_reason).
+
+    With a `profile` and firmographics on hand, derive both from the fit model;
+    otherwise fall back to the literal `company.company_fit` with no reason (the
+    pre-Slice-8 behaviour), so callers that pass neither are unaffected.
+    """
+    if profile is not None and company.firmographics is not None:
+        assessment = assess_fit(company.firmographics, profile)
+        return assessment.score, assessment.reason
+    return company.company_fit, None
+
+
 def run_pipeline_detailed(
     companies: list[CompanyInputs],
     *,
+    candidate_profile: CandidateProfile | None = None,
     observed_at: datetime | None = None,
     now: datetime | None = None,
     extractor=None,
@@ -106,19 +128,31 @@ def run_pipeline_detailed(
 
     `run_pipeline` is the thin opportunities-only wrapper; this is the variant
     callers use when they also need the signals (e.g. to persist them).
+
+    When `candidate_profile` is given, each company's `company_fit` is *derived*
+    from its firmographics against that profile (see `jobfinder.fit`) instead of
+    the literal `CompanyInputs.company_fit`; the derived reason rides into the
+    score breakdown and the opportunity's `why_now`.
     """
     signals_by_company: dict[str, list[Signal]] = defaultdict(list)
     fit_by_company: dict[str, float] = {}
+    fit_reasons: dict[str, str] = {}
     for company in companies:
         signals_by_company[company.company_id].extend(
             signals_for_company(
                 company, observed_at=observed_at, now=now, extractor=extractor
             )
         )
-        fit_by_company[company.company_id] = company.company_fit
+        fit_score, fit_reason = _fit_for_company(company, candidate_profile)
+        fit_by_company[company.company_id] = fit_score
+        if fit_reason is not None:
+            fit_reasons[company.company_id] = fit_reason
 
     opportunities = rank_opportunities(
-        dict(signals_by_company), company_fit=fit_by_company, now=now
+        dict(signals_by_company),
+        company_fit=fit_by_company,
+        company_fit_reasons=fit_reasons,
+        now=now,
     )
     all_signals = [s for sigs in signals_by_company.values() for s in sigs]
     return PipelineResult(signals=all_signals, opportunities=opportunities)
@@ -127,6 +161,7 @@ def run_pipeline_detailed(
 def run_pipeline(
     companies: list[CompanyInputs],
     *,
+    candidate_profile: CandidateProfile | None = None,
     observed_at: datetime | None = None,
     now: datetime | None = None,
     extractor=None,
@@ -137,5 +172,9 @@ def run_pipeline(
     run hermetic (regex fallback) unless a LLM is configured in the environment.
     """
     return run_pipeline_detailed(
-        companies, observed_at=observed_at, now=now, extractor=extractor
+        companies,
+        candidate_profile=candidate_profile,
+        observed_at=observed_at,
+        now=now,
+        extractor=extractor,
     ).opportunities

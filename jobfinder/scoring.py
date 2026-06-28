@@ -16,13 +16,16 @@ Component weights (plan section 4):
     recency            0.05   how fresh the freshest supporting signal is
 
 All six components now have sources wired in: liquidity (Form D) and
-leadership_vacuum (8-K) since Slice 2, and — as of Slice 5 — hiring_velocity and
-strategic_language, fed by the ATS hiring-pattern signals
-(``jobfinder.signals.ats_hiring``). ``company_fit`` stays caller-supplied and
+leadership_vacuum (8-K) since Slice 2; hiring_velocity and strategic_language,
+fed by the ATS hiring-pattern signals (``jobfinder.signals.ats_hiring``), since
+Slice 5; and — as of Slice 8 — ``company_fit``, derived from firmographics by
+``jobfinder.fit`` and threaded in by the pipeline as a score + a human reason.
 ``recency`` derives from the freshest supporting signal. This validated the
-design: lighting up the ATS components required *no* change to this scorer — the
-new signal types were already mapped (see ``_HIRING_TYPES``/``_STRATEGIC_TYPES``)
-and the weights already summed to 1.0; the scorer is the stable seam.
+design repeatedly: lighting up each of those components required *no* change to
+this scorer — the new signal types were already mapped (see
+``_HIRING_TYPES``/``_STRATEGIC_TYPES``), ``company_fit`` was already a
+caller-supplied float, and the weights already summed to 1.0; the scorer is the
+stable seam.
 """
 
 from __future__ import annotations
@@ -197,7 +200,14 @@ def derive_persona(signals: list[Signal]) -> tuple[str, str | None]:
 
 @dataclass(frozen=True)
 class ScoreComponent:
-    """One weighted component of an opportunity score, with its provenance."""
+    """One weighted component of an opportunity score, with its provenance.
+
+    `note` is a short human label for the component. `reason` carries a
+    *structured* explanation for components whose provenance is not a signal id
+    (today only `company_fit`, whose firmographic reason has no Signal behind
+    it) — so `why_now` can surface it directly rather than re-parsing it out of
+    the display label.
+    """
 
     name: str
     weight: float
@@ -205,6 +215,7 @@ class ScoreComponent:
     contribution: float  # weight * raw
     signal_ids: list[str] = field(default_factory=list)
     note: str = ""
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -278,12 +289,17 @@ def score_company(
     signals: list[Signal],
     *,
     company_fit: float = 0.5,
+    company_fit_reason: str | None = None,
     now: datetime | None = None,
 ) -> ScoreBreakdown:
     """Compute the weighted composite score for one company's signals.
 
-    `company_fit` is a caller-supplied [0, 1] match score (firmographics,
-    candidate background); it defaults to a neutral 0.5 until a fit model exists.
+    `company_fit` is a [0, 1] match score derived from firmographics against the
+    candidate profile (see `jobfinder.fit.assess_fit`); it defaults to a neutral
+    0.5 when a caller supplies no fit. `company_fit_reason` is the matching short
+    human explanation that rides in the component note (e.g. "Robotics matches
+    target sector; Series B near target stage"), keeping a derived fit as
+    explainable as the signal-backed components.
     """
     now = now or _utcnow()
 
@@ -293,23 +309,29 @@ def score_company(
     strategic_raw, strategic_ids = _max_strength(signals, _STRATEGIC_TYPES)
     recency_raw, recency_ids = _recency_score(signals, now)
     fit_raw = max(0.0, min(company_fit, 1.0))
+    # The fit reason is carried structurally (not folded into the note) so
+    # `why_now` can surface it without re-parsing the display label.
+    fit_note = "firmographic fit" if company_fit_reason else "caller-supplied fit"
 
-    raws: dict[str, tuple[float, list[str], str]] = {
-        "liquidity": (liquidity_raw, liquidity_ids, "Form D capital raised"),
-        "leadership_vacuum": (vacuum_raw, vacuum_ids, vacuum_note),
-        "hiring_velocity": (hiring_raw, hiring_ids, "junior-req surge (ATS)"),
+    # name -> (raw, signal_ids, note, reason). Only company_fit carries a
+    # structured reason today (its provenance is firmographic, not a Signal).
+    raws: dict[str, tuple[float, list[str], str, str]] = {
+        "liquidity": (liquidity_raw, liquidity_ids, "Form D capital raised", ""),
+        "leadership_vacuum": (vacuum_raw, vacuum_ids, vacuum_note, ""),
+        "hiring_velocity": (hiring_raw, hiring_ids, "junior-req surge (ATS)", ""),
         "strategic_language": (
             strategic_raw,
             strategic_ids,
             "greenfield/stack wording",
+            "",
         ),
-        "company_fit": (fit_raw, [], "caller-supplied fit"),
-        "recency": (recency_raw, recency_ids, "freshness of newest signal"),
+        "company_fit": (fit_raw, [], fit_note, company_fit_reason or ""),
+        "recency": (recency_raw, recency_ids, "freshness of newest signal", ""),
     }
 
     components: list[ScoreComponent] = []
     for name, weight in WEIGHTS.items():
-        raw, ids, note = raws[name]
+        raw, ids, note, reason = raws[name]
         components.append(
             ScoreComponent(
                 name=name,
@@ -318,6 +340,7 @@ def score_company(
                 contribution=round(weight * raw, 4),
                 signal_ids=ids,
                 note=note,
+                reason=reason,
             )
         )
 
@@ -355,6 +378,13 @@ def _why_now(
         if parts
         else "No active signals; ranked on baseline fit only."
     )
+    # The company_fit component carries no signal ids (it's firmographic, not
+    # signal-backed) so it's excluded from the loop above; surface a *derived*
+    # fit explicitly — reading the structured `reason`, not re-parsing the note —
+    # so the reason a company fits stays as visible as the score.
+    fit = breakdown.component("company_fit")
+    if fit.reason:
+        base += f" Fit {fit.raw:.0%}: {fit.reason}."
     if persona_source is not None:
         base += f" Persona '{persona}' inferred from signal {persona_source}."
     return base
@@ -421,14 +451,20 @@ def rank_opportunities(
     signals_by_company: dict[str, list[Signal]],
     *,
     company_fit: dict[str, float] | None = None,
+    company_fit_reasons: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> list[Opportunity]:
     """Score every company and return Opportunities ranked best-first.
 
     Companies with no supporting signals are skipped (the schema forbids an
     Opportunity with no citations, and they carry no intent anyway).
+
+    `company_fit` / `company_fit_reasons` are per-company maps the pipeline
+    builds from `jobfinder.fit`: the derived [0, 1] fit score and its matching
+    human reason. A company absent from the maps falls back to the neutral 0.5.
     """
     company_fit = company_fit or {}
+    company_fit_reasons = company_fit_reasons or {}
     opportunities: list[Opportunity] = []
     for company_id, signals in signals_by_company.items():
         if not signals:
@@ -437,6 +473,7 @@ def rank_opportunities(
             company_id,
             signals,
             company_fit=company_fit.get(company_id, 0.5),
+            company_fit_reason=company_fit_reasons.get(company_id),
             now=now,
         )
         if not breakdown.supporting_signal_ids:
