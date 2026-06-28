@@ -79,6 +79,29 @@ Correlating 5.02 with items like 4.01/4.02 (auditor changes, restatements) diagn
 One signal is a lead. Three or more concurrently is the highest tier of predictive
 hiring intent.
 
+## Architecture: modular monolith, with the first A2A seam
+
+The pipeline runs in-process today (collectors → scorer → CLI), which keeps it
+simple to test and reason about. The target architecture, though, is a Google
+ADK + Gemini orchestrator that delegates to specialist services over the
+[A2A protocol](https://google.github.io/adk-docs/a2a/). The 8-K specialist is
+the first module to cross that seam:
+
+```
+  ADK + Gemini orchestrator  ──A2A──▶  8-K signal specialist
+  (RemoteA2aAgent sub-agent)           (LangGraph StateGraph behind to_a2a())
+                                        └─ reuses the in-process extractor,
+                                           speaks the Signal schema on the wire
+```
+
+`jobfinder/a2a/` holds this extraction: a LangGraph graph wraps the existing
+8-K extractor, a thin ADK `BaseAgent` exposes it via `to_a2a()` (serving an
+agent card at `/.well-known/agent-card.json`), and an `LlmAgent` orchestrator
+consumes it as a `RemoteA2aAgent`. The wire contract (`jobfinder/a2a/contract.py`)
+is built on the framework-free `Signal`/`Evidence` schema — the domain object
+*is* the contract. The in-process path and CLI are unchanged; A2A is an
+additional consumption path, not a replacement.
+
 ## Getting started
 
 This project uses [uv](https://docs.astral.sh/uv/) and targets the Python version
@@ -127,6 +150,7 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] Pillar II: SEC Form D collector (EDGAR)
 - [x] Composite intent scorer + ranked-opportunity CLI demo
 - [x] Persistence layer (SQLite/Postgres via SQLAlchemy) — runs accumulate for cross-run diffing
+- [x] First A2A extraction: 8-K specialist as a LangGraph service behind `to_a2a()`, consumed by an ADK + Gemini `RemoteA2aAgent` orchestrator
 - [ ] Pillar I: ATS collectors (Greenhouse / Lever / Ashby)
 - [ ] Reporter (digest output)
 - [ ] Enrichment integrations (contacts, firmographics)
