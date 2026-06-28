@@ -66,6 +66,44 @@ def signals_for_company(
     return signals
 
 
+@dataclass
+class PipelineResult:
+    """Everything a run produced: the extracted signals and the ranked
+    opportunities. The CLI prints the opportunities; the store persists both,
+    because cross-run diffing (Pillar I) needs the raw signal history, not just
+    the scored output."""
+
+    signals: list[Signal] = field(default_factory=list)
+    opportunities: list[Opportunity] = field(default_factory=list)
+
+
+def run_pipeline_detailed(
+    companies: list[CompanyInputs],
+    *,
+    observed_at: datetime | None = None,
+    now: datetime | None = None,
+    extractor=None,
+) -> PipelineResult:
+    """Run the pipeline and return both the signals and the ranked opportunities.
+
+    `run_pipeline` is the thin opportunities-only wrapper; this is the variant
+    callers use when they also need the signals (e.g. to persist them).
+    """
+    signals_by_company: dict[str, list[Signal]] = defaultdict(list)
+    fit_by_company: dict[str, float] = {}
+    for company in companies:
+        signals_by_company[company.company_id].extend(
+            signals_for_company(company, observed_at=observed_at, extractor=extractor)
+        )
+        fit_by_company[company.company_id] = company.company_fit
+
+    opportunities = rank_opportunities(
+        dict(signals_by_company), company_fit=fit_by_company, now=now
+    )
+    all_signals = [s for sigs in signals_by_company.values() for s in sigs]
+    return PipelineResult(signals=all_signals, opportunities=opportunities)
+
+
 def run_pipeline(
     companies: list[CompanyInputs],
     *,
@@ -78,14 +116,6 @@ def run_pipeline(
     `extractor` is forwarded to the 8-K signal stage; leaving it None keeps the
     run hermetic (regex fallback) unless a LLM is configured in the environment.
     """
-    signals_by_company: dict[str, list[Signal]] = defaultdict(list)
-    fit_by_company: dict[str, float] = {}
-    for company in companies:
-        signals_by_company[company.company_id].extend(
-            signals_for_company(company, observed_at=observed_at, extractor=extractor)
-        )
-        fit_by_company[company.company_id] = company.company_fit
-
-    return rank_opportunities(
-        dict(signals_by_company), company_fit=fit_by_company, now=now
-    )
+    return run_pipeline_detailed(
+        companies, observed_at=observed_at, now=now, extractor=extractor
+    ).opportunities
