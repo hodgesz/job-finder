@@ -2,7 +2,14 @@
 
 from datetime import date, datetime, timezone
 
-from jobfinder.cli import _demo_companies, _store_url, build_parser, main, render
+from jobfinder.cli import (
+    _demo_companies,
+    _parse_since,
+    _store_url,
+    build_parser,
+    main,
+    render,
+)
 from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detailed
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.edgar import Filing, FormD
@@ -175,6 +182,71 @@ def test_main_demo_without_db_does_not_persist(capsys):
     assert code == 0
     out = capsys.readouterr().out
     assert "Persisted to" not in out
+
+
+def test_parse_since_handles_bare_date_and_naive_datetime():
+    # A bare date -> midnight UTC.
+    assert _parse_since("2026-06-01") == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    # A naive datetime is assumed UTC.
+    assert _parse_since("2026-06-01T12:00:00") == datetime(
+        2026, 6, 1, 12, tzinfo=timezone.utc
+    )
+
+
+def test_main_report_reads_persisted_db(tmp_path, capsys):
+    db = tmp_path / "runs.db"
+    main(["demo", "--db", str(db)])
+    capsys.readouterr()
+    code = main(["report", "--db", str(db)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Opportunity digest — current standings" in out
+    assert "co-northwind" in out
+    # Evidence citations survive from persistence into the digest.
+    assert "0001950000-26-000003:form_d" in out
+
+
+def test_main_report_since_flags_new(tmp_path, capsys):
+    db = tmp_path / "runs.db"
+    main(["demo", "--db", str(db)])
+    capsys.readouterr()
+    # Everything was just written, so a cutoff in the past flags all as new.
+    code = main(["report", "--db", str(db), "--since", "2026-01-01"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "what changed since 2026-01-01" in out
+    assert "[NEW]" in out
+    assert "Newly appeared signals" in out
+
+
+def test_main_report_respects_top(tmp_path, capsys):
+    db = tmp_path / "runs.db"
+    main(["demo", "--db", str(db)])
+    capsys.readouterr()
+    code = main(["--top", "1", "report", "--db", str(db)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "showing 1." in out
+    assert "co-northwind" in out
+    assert "co-atlas" not in out
+
+
+def test_main_report_empty_db_is_graceful(tmp_path, capsys):
+    db = tmp_path / "empty.db"
+    code = main(["report", "--db", str(db)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "No opportunities on file." in out
+
+
+def test_report_requires_db():
+    parser = build_parser()
+    try:
+        parser.parse_args(["report"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:  # pragma: no cover
+        raise AssertionError("expected SystemExit for missing --db")
 
 
 def test_live_requires_user_agent():

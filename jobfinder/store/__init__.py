@@ -25,6 +25,18 @@ Design choices that mirror the rest of the codebase:
 
 from __future__ import annotations
 
-from jobfinder.store.db import PersistResult, Store
+from jobfinder.store.db import (
+    OpportunityChange,
+    PersistResult,
+    SignalChange,
+    Store,
+    StoreDiff,
+)
 
-__all__ = ["PersistResult", "Store"]
+__all__ = [
+    "OpportunityChange",
+    "PersistResult",
+    "SignalChange",
+    "Store",
+    "StoreDiff",
+]

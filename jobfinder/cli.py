@@ -28,6 +28,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detailed
+from jobfinder.reporter import render_digest
 from jobfinder.schemas import Opportunity
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
@@ -373,11 +374,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Contact User-Agent, e.g. 'job-finder you@example.com' (SEC requires "
         "a contact email when fetching filings).",
     )
+
+    report = sub.add_parser(
+        "report",
+        help="Render a cross-run digest from a persisted --db (no network).",
+    )
+    report.add_argument(
+        "--db",
+        required=True,
+        help=(
+            "The store to read (a SQLite path like 'runs.db' or any SQLAlchemy "
+            "URL). Reports over whatever past runs were persisted there."
+        ),
+    )
+    report.add_argument(
+        "--since",
+        default=None,
+        metavar="DATE",
+        help=(
+            "Diff cutoff as an ISO date/datetime (e.g. '2026-06-01'). "
+            "Opportunities first seen on/after it are flagged NEW and only "
+            "signals first seen on/after it are listed. Omit for a plain ranked "
+            "standings digest."
+        ),
+    )
     return parser
+
+
+def _parse_since(value: str) -> datetime:
+    """Parse a ``--since`` ISO date or datetime into a tz-aware UTC datetime.
+
+    A bare date ('2026-06-01') is read as midnight UTC; a naive datetime is
+    assumed UTC, matching how the store normalises its timestamps.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.command == "report":
+        return _report(args.db, since=args.since, top=args.top)
 
     if args.command == "demo":
         companies = _demo_companies()
@@ -415,6 +455,20 @@ def main(argv: list[str] | None = None) -> int:
 def _persist(result: PipelineResult, db: str) -> PersistResult:
     store = Store(_store_url(db))
     return store.persist_run(result.signals, result.opportunities)
+
+
+def _report(db: str, *, since: str | None, top: int) -> int:
+    """Render a cross-run digest from a persisted store. No network, no clock
+    baked in beyond `now` (utcnow) for relative ages."""
+    since_dt = _parse_since(since) if since else None
+    # create=True (the default) keeps the offline contract: pointed at a fresh
+    # or empty store the digest renders "No opportunities on file." rather than
+    # erroring, and construction also runs the additive migration that brings a
+    # store written by an earlier slice up to the current schema.
+    store = Store(_store_url(db))
+    diff = store.diff(since=since_dt)
+    print(render_digest(diff, now=datetime.now(timezone.utc), top=top))
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

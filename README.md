@@ -127,6 +127,13 @@ uv run python -m jobfinder.cli live --cik 320193 \
   --user-agent "job-finder you@example.com" \
   --db "postgresql+psycopg://user:pw@localhost/jobfinder"
 
+# Report a cross-run digest from a persisted store (no network). Without
+# --since it prints the current ranked standings; with --since it diffs against
+# that cutoff, flagging new vs recurring opportunities, score movement, and the
+# signals that newly appeared:
+uv run python -m jobfinder.cli report --db runs.db
+uv run python -m jobfinder.cli report --db runs.db --since 2026-06-01
+
 # Run the tests
 uv run pytest
 ```
@@ -152,7 +159,7 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] Persistence layer (SQLite/Postgres via SQLAlchemy) — runs accumulate for cross-run diffing
 - [x] First A2A extraction: 8-K specialist as a LangGraph service behind `to_a2a()`, consumed by an ADK + Gemini `RemoteA2aAgent` orchestrator
 - [x] Pillar I: ATS collectors (Greenhouse / Lever / Ashby) — hiring-velocity / department-surge / greenfield-team signals, activating the `hiring_velocity` + `strategic_language` scorer components
-- [ ] Reporter (digest output)
+- [x] Reporter (cross-run digest) — `report --db [--since]` turns accumulated runs into a prioritized "what changed since last week" view (new vs recurring, score movement, newly-appeared signals)
 - [ ] Enrichment integrations (contacts, firmographics)
 
 ## Legal & ethical use
