@@ -230,6 +230,10 @@ def assess_fit(
     )
     score = round(min(max(score, 0.0), 1.0), 3)
 
+    # A fragment is omitted only when the profile expresses no preference on that
+    # dimension; if all three are omitted the profile carries no criteria at all
+    # (the firmographics may well be present), so say that rather than implying
+    # the company had no firmographics to assess.
     fragments = [f for f in (sector_frag, stage_frag, size_frag) if f]
-    reason = "; ".join(fragments) if fragments else "no firmographics to assess"
+    reason = "; ".join(fragments) if fragments else "no fit criteria specified"
     return FitAssessment(score=score, reason=reason, fragments=fragments)

@@ -118,7 +118,18 @@ def test_empty_profile_expresses_no_preference():
     result = assess_fit(firmo, CandidateProfile())
     assert result.score == pytest.approx(NEUTRAL)
     assert result.fragments == []
-    assert result.reason == "no firmographics to assess"
+    # The firmographics ARE present here — it's the profile that has no criteria,
+    # so the reason must not claim there was nothing to assess.
+    assert result.reason == "no fit criteria specified"
+
+
+def test_no_criteria_reason_does_not_imply_missing_firmographics():
+    # Profile with no criteria but firmographics present: the reason describes
+    # the missing *criteria*, not missing firmographics (Bugbot finding).
+    firmo = Firmographics(sector="Robotics", employee_count=200)
+    result = assess_fit(firmo, CandidateProfile())
+    assert "firmographics" not in result.reason
+    assert result.reason == "no fit criteria specified"
 
 
 def test_score_is_deterministic_and_bounded():
