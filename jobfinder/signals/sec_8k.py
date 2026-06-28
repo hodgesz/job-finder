@@ -62,6 +62,31 @@ _APPOINTMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The standard Item 5.02 caption is itself "Departure of Directors or Certain
+# Officers; Election of Directors; Appointment of Certain Officers;
+# Compensatory Arrangements of Certain Officers". Left in place, this
+# boilerplate matches both the departure and appointment regexes on EVERY
+# 5.02 filing, making everything look successor-present. Because the caption
+# is fixed text, we strip it (and any "Item 5.02" label) by matching its known
+# clauses rather than a fragile span regex.
+_ITEM_502_CAPTION_CLAUSES = [
+    r"item\s*5\.02",
+    r"departure\s+of\s+directors?\s+or\s+certain\s+officers",
+    r"election\s+of\s+directors?",
+    r"appointment\s+of\s+certain\s+officers",
+    r"compensatory\s+arrangements?\s+of\s+certain\s+officers",
+]
+_ITEM_502_CAPTION_RE = re.compile(
+    r"(?:" + r"|".join(_ITEM_502_CAPTION_CLAUSES) + r")[;.\s]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_item_caption(text: str) -> str:
+    """Remove the boilerplate Item 5.02 heading so event regexes only see the
+    actual disclosed narrative, not the caption's own 'Appointment/Election'."""
+    return _ITEM_502_CAPTION_RE.sub(" ", text)
+
 
 @dataclass(frozen=True)
 class ExecEvents:
@@ -99,13 +124,18 @@ def parse_item_502(document: str, *, item_known: bool | None = None) -> ExecEven
     lowered = text.lower()
 
     has_item = bool(item_known) or "item 5.02" in lowered or "5.02" in lowered
-    has_departure = bool(_DEPARTURE_RE.search(text))
-    has_appointment = bool(_APPOINTMENT_RE.search(text))
+
+    # Detect events against the body with the boilerplate caption removed, so
+    # the caption's own "Departure/Election/Appointment" wording is not read
+    # as disclosed events.
+    body = _strip_item_caption(text)
+    has_departure = bool(_DEPARTURE_RE.search(body))
+    has_appointment = bool(_APPOINTMENT_RE.search(body))
 
     roles = [
         role
         for role, pat in _EXEC_ROLE_PATTERNS.items()
-        if re.search(pat, text, re.IGNORECASE)
+        if re.search(pat, body, re.IGNORECASE)
     ]
 
     return ExecEvents(

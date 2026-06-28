@@ -156,10 +156,11 @@ class EdgarClient:
     def recent_8k(self, cik: str | int, *, item: str | None = None) -> list[Filing]:
         """Recent 8-K filings, optionally restricted to those disclosing `item`.
 
-        `item` is matched from the index `items` field, so this does not
-        download any documents.
+        Includes amendments (``8-K/A``), which can themselves disclose
+        Item 5.02 events. `item` is matched from the index `items` field, so
+        this does not download any documents.
         """
-        filings = [f for f in self.recent_filings(cik) if f.form == "8-K"]
+        filings = [f for f in self.recent_filings(cik) if f.form in ("8-K", "8-K/A")]
         if item is not None:
             filings = [f for f in filings if item in f.items]
         return filings

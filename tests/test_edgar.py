@@ -16,7 +16,7 @@ def _submissions_fetcher(_url: str) -> str:
 
 def test_parse_submissions_reads_parallel_arrays():
     filings = parse_submissions((FIXTURES / "submissions_sample.json").read_text())
-    assert len(filings) == 3
+    assert len(filings) == 4
     first = filings[0]
     assert first.form == "8-K"
     assert first.accession_number == "0001140361-26-015711"
@@ -38,10 +38,19 @@ def test_filing_url_construction():
 def test_recent_8k_filters_by_item_without_fetching_docs():
     client = EdgarClient(_submissions_fetcher)
     all_8k = client.recent_8k(320193)
-    assert len(all_8k) == 2  # excludes the 10-Q
+    assert len(all_8k) == 3  # two 8-K + one 8-K/A; excludes the 10-Q
     only_502 = client.recent_8k(320193, item="5.02")
-    assert len(only_502) == 1
-    assert only_502[0].accession_number == "0001140361-26-015711"
+    # The original 8-K and its 8-K/A amendment both disclose Item 5.02.
+    assert {f.accession_number for f in only_502} == {
+        "0001140361-26-015711",
+        "0001140361-26-016000",
+    }
+
+
+def test_recent_8k_includes_amendments():
+    client = EdgarClient(_submissions_fetcher)
+    forms = {f.form for f in client.recent_8k(320193)}
+    assert "8-K/A" in forms
 
 
 def test_recent_8k_accepts_padded_and_prefixed_cik():

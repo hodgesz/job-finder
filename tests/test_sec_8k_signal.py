@@ -17,11 +17,22 @@ OBSERVED = datetime(2026, 5, 1, tzinfo=timezone.utc)
 APPLE_502 = (FIXTURES / "8k_item502_apple.txt").read_text()
 
 # Synthetic: a departure with NO successor named in the filing.
+# IMPORTANT: this carries the *full* standard Item 5.02 caption (which itself
+# contains the words "Election" and "Appointment"). A realistic departure-only
+# filing always does, so the parser must not read the caption as an event.
 VACUUM_DOC = (
-    "Item 5.02 Departure of Directors or Certain Officers. "
+    "Item 5.02 Departure of Directors or Certain Officers; Election of Directors; "
+    "Appointment of Certain Officers; Compensatory Arrangements of Certain Officers. "
     "On May 1, 2026, Jane Doe, the Company's Chief Financial Officer, "
     "notified the Board of her resignation, effective immediately. "
     "The Company has commenced a search for a permanent successor."
+)
+
+# Synthetic: an appointment with NO departure disclosed in the body.
+APPOINTMENT_ONLY_DOC = (
+    "Item 5.02 Departure of Directors or Certain Officers; Election of Directors; "
+    "Appointment of Certain Officers. On June 1, 2026, the Board appointed "
+    "John Smith as Chief Financial Officer, effective immediately."
 )
 
 
@@ -50,9 +61,25 @@ def test_parse_real_filing_detects_departure_and_appointment():
 def test_vacuum_doc_flags_leadership_gap():
     events = parse_item_502(VACUUM_DOC, item_known=True)
     assert events.has_departure
+    # The full Item 5.02 caption mentions "Appointment"/"Election", but no
+    # successor is actually disclosed in the body, so this is a vacuum.
+    assert not events.has_appointment
     assert not events.successor_present
     assert events.is_leadership_vacuum
     assert "CFO" in events.roles
+
+
+def test_appointment_only_does_not_emit_departure():
+    events = parse_item_502(APPOINTMENT_ONLY_DOC, item_known=True)
+    assert events.has_appointment
+    # Caption says "Departure ...", but nobody actually departed in the body.
+    assert not events.has_departure
+    assert not events.is_leadership_vacuum
+
+    signals = signals_from_filing(
+        _filing(["5.02"]), APPOINTMENT_ONLY_DOC, company_id="co-x", observed_at=OBSERVED
+    )
+    assert {s.signal_type for s in signals} == {"8k_exec_appointment"}
 
 
 def test_signals_from_real_filing_have_cited_evidence():
