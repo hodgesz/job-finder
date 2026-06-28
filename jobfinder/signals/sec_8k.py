@@ -51,11 +51,27 @@ _EXEC_ROLE_PATTERNS = {
     "Director": r"\bdirector\b",
 }
 
-# Language that indicates someone is leaving.
+# Language that indicates someone is actually leaving.
+#
+# These must be *event*-shaped, not compensation wording. Item 5.02(e) covers
+# compensatory arrangements, so a filing can mention "severance upon
+# termination" or "retirement benefits" with nobody departing. We therefore
+# match departure verbs (resigned, stepped down, transitioned from a role) and
+# gate the comp-prone words: bare "termination"/"retirement" are excluded;
+# "termination" must be tied to employment, and "retirement" to a person.
 _DEPARTURE_RE = re.compile(
-    r"\b(resign(?:ed|ation|s)?|depart(?:ed|ure|s)?|step(?:ping|ped)?\s+down|"
-    r"termination|terminated|retire(?:d|ment|s)?|will\s+transition\s+from|"
-    r"transition\s+from\s+(?:his|her|their)\s+role|removed?)\b",
+    r"\b(?:"
+    r"resign(?:ed|ation|s)?"
+    r"|depart(?:ed|ure|s)?"
+    r"|step(?:ping|ped)?\s+down"
+    r"|will\s+transition\s+from"
+    r"|transition(?:ed|ing|s)?\s+from\s+(?:his|her|their)\s+role"
+    r"|removed?\s+(?:as|from)\b"
+    r"|retir(?:e|ed|es|ing)\b"  # verb forms only, not the noun "retirement"
+    r"|(?:his|her|their)\s+retirement"  # "announced her retirement"
+    r"|terminat\w*\s+(?:his|her|their|the)\s+employment"
+    r"|employment[^.]{0,30}\bterminat\w+"
+    r")",
     re.IGNORECASE,
 )
 

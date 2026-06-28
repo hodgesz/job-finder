@@ -8,6 +8,8 @@ exercise the leadership-vacuum classifier.
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from jobfinder.signals.sec_8k import parse_item_502, signals_from_filing
 from jobfinder.sources.edgar import Filing
 
@@ -33,6 +35,16 @@ APPOINTMENT_ONLY_DOC = (
     "Item 5.02 Departure of Directors or Certain Officers; Election of Directors; "
     "Appointment of Certain Officers. On June 1, 2026, the Board appointed "
     "John Smith as Chief Financial Officer, effective immediately."
+)
+
+# Synthetic: a *compensatory-only* 5.02(e) filing. Mentions "termination" and
+# "retirement" as comp terms, but nobody actually departs.
+COMP_ONLY_DOC = (
+    "Item 5.02 Departure of Directors or Certain Officers; Election of Directors; "
+    "Appointment of Certain Officers; Compensatory Arrangements of Certain Officers. "
+    "On May 1, 2026, the Compensation Committee approved an amended employment "
+    "agreement for the Chief Financial Officer providing enhanced severance upon a "
+    "termination without cause and additional retirement benefits."
 )
 
 
@@ -125,6 +137,36 @@ def test_item_label_still_detected_in_body_fallback():
     events = parse_item_502(VACUUM_DOC)  # no item_known
     assert events.has_item_502
     assert events.is_leadership_vacuum
+
+
+def test_compensatory_only_not_treated_as_departure():
+    # Item 5.02(e) comp terms ("severance upon termination", "retirement
+    # benefits") must not be read as an executive departure / vacuum.
+    events = parse_item_502(COMP_ONLY_DOC, item_known=True)
+    assert not events.has_departure
+    assert not events.is_leadership_vacuum
+    signals = signals_from_filing(
+        _filing(["5.02"]), COMP_ONLY_DOC, company_id="co-x", observed_at=OBSERVED
+    )
+    assert all(s.signal_type != "8k_exec_departure" for s in signals)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Jane Doe, the CFO, notified the Board of her resignation, effective immediately.",
+        "John Roe stepped down as Chief Operating Officer on June 2, 2026.",
+        "The Company announced that its President will retire effective year-end.",
+        "The Board terminated the employment of the Chief Revenue Officer, effective immediately.",
+        "The director was removed from the Board effective today.",
+    ],
+)
+def test_real_departure_phrasings_still_detected(phrase):
+    caption = (
+        "Item 5.02 Departure of Directors or Certain Officers; Election of Directors; "
+        "Appointment of Certain Officers; Compensatory Arrangements of Certain Officers. "
+    )
+    assert parse_item_502(caption + phrase, item_known=True).has_departure
 
 
 def test_non_502_filing_yields_no_signals():
