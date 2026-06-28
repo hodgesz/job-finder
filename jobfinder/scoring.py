@@ -130,30 +130,42 @@ _PERSONA_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 )
 
 
-def _persona_text(signal: Signal) -> str:
-    """The role/department text on a signal to match persona rules against.
+def _persona_fragments(signal: Signal) -> list[str]:
+    """The role/department text fragments to match persona rules against, in the
+    order they were disclosed.
 
     8-K departures carry the vacated role(s) in ``extracted_facts['roles']``; the
     ATS signals carry a ``department`` and (for greenfield) a ``posting_title``.
-    We concatenate whatever is present so one matcher serves every source.
+    Each is kept as its own fragment — NOT joined into one blob — so a signal
+    disclosing several roles (e.g. a CTO *and* a CFO departing in one filing) is
+    matched role-by-role in listed order, letting the *primary* (first-listed)
+    role win rather than whichever role a `_PERSONA_RULES` pattern happens to sit
+    earliest in the table.
     """
     facts = signal.extracted_facts
-    parts: list[str] = []
+    fragments: list[str] = []
     roles = facts.get("roles")
     if isinstance(roles, list):
-        parts.extend(str(r) for r in roles if r)
+        fragments.extend(str(r) for r in roles if r)
     for key in ("department", "posting_title"):
         value = facts.get(key)
         if value:
-            parts.append(str(value))
-    return " ".join(parts)
+            fragments.append(str(value))
+    return fragments
 
 
-def _match_persona(text: str) -> str | None:
-    """First persona whose rule matches `text`, or None if nothing does."""
-    for pattern, persona in _PERSONA_RULES:
-        if pattern.search(text):
-            return persona
+def _match_persona(fragments: list[str]) -> str | None:
+    """Persona for the first fragment that matches any rule, or None.
+
+    Fragments are tried in order (disclosed order), and within a fragment the
+    rule table's first match wins. Trying fragment-by-fragment means the
+    first-listed role/department drives the persona, so role *listing* order beats
+    rule-table order when a signal carries more than one role.
+    """
+    for fragment in fragments:
+        for pattern, persona in _PERSONA_RULES:
+            if pattern.search(fragment):
+                return persona
     return None
 
 
@@ -177,7 +189,7 @@ def derive_persona(signals: list[Signal]) -> tuple[str, str | None]:
         for signal in sorted(
             by_type.get(signal_type, []), key=lambda s: s.strength, reverse=True
         ):
-            persona = _match_persona(_persona_text(signal))
+            persona = _match_persona(_persona_fragments(signal))
             if persona is not None:
                 return persona, signal.id
     return DEFAULT_PERSONA, None

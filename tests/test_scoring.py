@@ -261,6 +261,30 @@ def test_derive_persona_vice_president_is_not_ceo(role, expected):
     assert persona == expected
 
 
+def test_derive_persona_multi_role_follows_listed_order_not_table_order():
+    # One 8-K disclosing two departures: CTO listed first, CFO second. The
+    # primary (first-listed) role must drive the persona, even though the finance
+    # rule sits earlier in _PERSONA_RULES than the engineering rule.
+    sig = _signal(
+        "s-multi",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": ["CTO", "CFO"]},
+    )
+    persona, source = derive_persona([sig])
+    assert persona == "VP Engineering / Engineering leader"
+    assert source == "s-multi"
+    # And the reverse listing yields the finance persona.
+    sig_rev = _signal(
+        "s-multi-rev",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": ["CFO", "CTO"]},
+    )
+    persona_rev, _ = derive_persona([sig_rev])
+    assert persona_rev == "CFO / VP Finance"
+
+
 def test_derive_persona_vacuum_wins_over_surge():
     # A CFO departure (a confirmed open seat) outranks a concurrent Engineering
     # build-out as the persona source, regardless of signal strength.
