@@ -151,7 +151,7 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] Composite intent scorer + ranked-opportunity CLI demo
 - [x] Persistence layer (SQLite/Postgres via SQLAlchemy) — runs accumulate for cross-run diffing
 - [x] First A2A extraction: 8-K specialist as a LangGraph service behind `to_a2a()`, consumed by an ADK + Gemini `RemoteA2aAgent` orchestrator
-- [ ] Pillar I: ATS collectors (Greenhouse / Lever / Ashby)
+- [x] Pillar I: ATS collectors (Greenhouse / Lever / Ashby) — hiring-velocity / department-surge / greenfield-team signals, activating the `hiring_velocity` + `strategic_language` scorer components
 - [ ] Reporter (digest output)
 - [ ] Enrichment integrations (contacts, firmographics)
 

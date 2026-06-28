@@ -58,10 +58,11 @@ def test_pipeline_company_with_no_signals_is_dropped():
     assert [o.company_id for o in opps] == ["co-funded"]
 
 
-def test_demo_dataset_produces_three_ranked_opportunities():
+def test_demo_dataset_produces_ranked_opportunities():
     opps = _run(_demo_companies())
     ids = [o.company_id for o in opps]
-    assert ids == ["co-northwind", "co-lumen", "co-atlas"]
+    # Northwind (all four pillars) leads; Helix is the ATS-only company.
+    assert ids == ["co-northwind", "co-lumen", "co-helix", "co-atlas"]
 
 
 def test_demo_northwind_is_funding_plus_vacuum():
@@ -99,7 +100,7 @@ def test_main_demo_prints_report(capsys):
     code = main(["demo"])
     assert code == 0
     out = capsys.readouterr().out
-    assert "Top 3 companies" in out
+    assert "Top 4 companies" in out
     assert "Northwind Robotics Inc." in out
 
 
@@ -119,6 +120,7 @@ def test_run_pipeline_detailed_returns_signals_and_opportunities():
     assert [o.company_id for o in result.opportunities] == [
         "co-northwind",
         "co-lumen",
+        "co-helix",
         "co-atlas",
     ]
     assert result.signals
@@ -146,7 +148,12 @@ def test_main_demo_persists_to_sqlite(tmp_path, capsys):
     # Re-open the same file and confirm the run actually landed.
     store = Store(_store_url(str(db)), create=False)
     opps = store.top_opportunities()
-    assert [o.company_id for o in opps] == ["co-northwind", "co-lumen", "co-atlas"]
+    assert [o.company_id for o in opps] == [
+        "co-northwind",
+        "co-lumen",
+        "co-helix",
+        "co-atlas",
+    ]
     assert store.signals_for_company("co-northwind")
 
 
@@ -159,8 +166,8 @@ def test_main_demo_rerun_updates_not_duplicates(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "updated" in out
     store = Store(_store_url(str(db)), create=False)
-    # Three companies -> exactly three opportunities, even after two runs.
-    assert len(store.top_opportunities()) == 3
+    # Four companies -> exactly four opportunities, even after two runs.
+    assert len(store.top_opportunities()) == 4
 
 
 def test_main_demo_without_db_does_not_persist(capsys):

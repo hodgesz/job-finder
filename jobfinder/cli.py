@@ -7,12 +7,16 @@ signals and Form D funding signals through the weighted scorer into ranked
 
 Two modes:
 
-    job-finder demo                 run the built-in offline dataset (no network)
-    job-finder live --cik 320193    fetch real filings for one or more CIKs
+    job-finder demo                          run the built-in offline dataset
+    job-finder live --cik 320193             fetch real SEC filings for CIK(s)
+    job-finder live --ats greenhouse:stripe  read a public ATS job board
+    job-finder live --cik 320193 --ats lever:netflix   both, per company
 
-The demo mode embeds its filings inline so it runs anywhere with zero network
-and zero API key — the regex fallback handles 8-K classification. `live` mode
-requires a SEC-compliant contact User-Agent (see --user-agent).
+The demo mode embeds its filings and job boards inline so it runs anywhere with
+zero network and zero API key — the regex fallback handles 8-K classification.
+`live` mode requires at least one source (--cik and/or --ats) and a contact
+User-Agent (see --user-agent); SEC mandates a contact email when fetching
+filings.
 
 Built on argparse (stdlib) — no new dependency.
 """
@@ -21,11 +25,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detailed
 from jobfinder.schemas import Opportunity
 from jobfinder.signals.extraction import RegexExtractor
+from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD, RelatedPerson
 from jobfinder.store import PersistResult, Store
 
@@ -36,14 +41,34 @@ _DEMO_NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 # --------------------------------------------------------------------------- #
 # Built-in offline demo dataset.
 # --------------------------------------------------------------------------- #
-def _demo_companies() -> list[CompanyInputs]:
-    """Three synthetic companies exercising the full signal matrix.
+def _demo_posting(
+    pid: str,
+    title: str,
+    *,
+    department: str | None = None,
+    days_ago: int = 5,
+) -> JobPosting:
+    """A demo job posting dated relative to the fixed demo `now`."""
+    return JobPosting(
+        id=pid,
+        title=title,
+        department=department,
+        updated_at=_DEMO_NOW - timedelta(days=days_ago),
+        url=f"https://jobs.example.com/{pid}",
+    )
 
-    - Northwind: fresh $55M raise *and* a CFO departure with no successor named
-      -> two concurrent signals, should rank first.
+
+def _demo_companies() -> list[CompanyInputs]:
+    """Four synthetic companies exercising the full signal matrix.
+
+    - Northwind: fresh $55M raise, a CFO departure with no successor named, AND
+      a hiring surge on its job board -> all four pillars fire, ranks first.
     - Lumen Bio: large raise only -> funding signal, mid rank.
     - Atlas Freight: CFO vacuum only -> leadership signal, lower than the
       funding+vacuum company.
+    - Helix Labs: no SEC filings at all, only a public ATS board with a
+      department surge and a founding leadership req -> demonstrates the new
+      Pillar I (hiring/strategic) lighting up standalone.
     """
     northwind_8k = Filing(
         cik="1950000",
@@ -119,12 +144,45 @@ def _demo_companies() -> list[CompanyInputs]:
         "replacement."
     )
 
+    # Northwind also has an active job board: a finance build-out behind its CFO
+    # departure, so all four pillars line up on one company.
+    northwind_board = JobBoard(
+        provider="greenhouse",
+        token="northwind",
+        url="https://boards.greenhouse.io/northwind",
+        postings=[
+            _demo_posting("nw1", "Senior Accountant", department="Finance"),
+            _demo_posting("nw2", "FP&A Manager", department="Finance"),
+            _demo_posting("nw3", "Revenue Operations Lead", department="Finance"),
+            _demo_posting("nw4", "Controller", department="Finance"),
+            _demo_posting("nw5", "Account Executive", department="Sales"),
+        ],
+    )
+
+    # Helix Labs: no SEC presence, only a public board. A clear Engineering
+    # surge plus an explicit founding leadership req -> Pillar I standalone.
+    helix_board = JobBoard(
+        provider="lever",
+        token="helix",
+        url="https://jobs.lever.co/helix",
+        postings=[
+            _demo_posting(
+                "hx1", "Founding Engineer, Platform", department="Engineering"
+            ),
+            _demo_posting("hx2", "Senior Backend Engineer", department="Engineering"),
+            _demo_posting("hx3", "ML Engineer", department="Engineering"),
+            _demo_posting("hx4", "Infrastructure Engineer", department="Engineering"),
+            _demo_posting("hx5", "Head of Data", department="Data"),
+        ],
+    )
+
     return [
         CompanyInputs(
             company_id="co-northwind",
             name="Northwind Robotics Inc.",
             eight_k=[(northwind_8k, northwind_8k_doc)],
             form_d=[(northwind_form_d_filing, northwind_form_d)],
+            ats_boards=[northwind_board],
             company_fit=0.8,
         ),
         CompanyInputs(
@@ -138,6 +196,12 @@ def _demo_companies() -> list[CompanyInputs]:
             name="Atlas Freight Inc.",
             eight_k=[(atlas_8k, atlas_8k_doc)],
             company_fit=0.6,
+        ),
+        CompanyInputs(
+            company_id="co-helix",
+            name="Helix Labs",
+            ats_boards=[helix_board],
+            company_fit=0.5,
         ),
     ]
 
@@ -158,6 +222,35 @@ def _live_companies(client: EdgarClient, ciks: list[str]) -> list[CompanyInputs]
                 name=f"CIK {cik}",
                 eight_k=eight_k,
                 form_d=form_d,
+            )
+        )
+    return companies
+
+
+def _parse_ats_spec(spec: str) -> tuple[str, str]:
+    """Parse a ``provider:token`` --ats argument, e.g. ``greenhouse:stripe``."""
+    provider, _, token = spec.partition(":")
+    provider = provider.strip().lower()
+    token = token.strip()
+    if provider not in PROVIDERS or not token:
+        raise ValueError(
+            f"--ats must be 'provider:token' where provider is one of "
+            f"{', '.join(PROVIDERS)}; got {spec!r}."
+        )
+    return provider, token
+
+
+def _ats_companies(client: AtsClient, specs: list[str]) -> list[CompanyInputs]:
+    """Build one company per ``provider:token`` board spec."""
+    companies: list[CompanyInputs] = []
+    for spec in specs:
+        provider, token = _parse_ats_spec(spec)
+        board = client.fetch_board(provider, token)
+        companies.append(
+            CompanyInputs(
+                company_id=f"ats-{provider}-{token}",
+                name=f"{token} ({provider})",
+                ats_boards=[board],
             )
         )
     return companies
@@ -257,15 +350,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     live = sub.add_parser(
-        "live", parents=[common], help="Fetch real filings for one or more CIKs."
+        "live",
+        parents=[common],
+        help="Fetch real filings (--cik) and/or public ATS boards (--ats).",
     )
     live.add_argument(
-        "--cik", action="append", required=True, help="SEC CIK (repeatable)."
+        "--cik", action="append", default=[], help="SEC CIK (repeatable)."
+    )
+    live.add_argument(
+        "--ats",
+        action="append",
+        default=[],
+        metavar="PROVIDER:TOKEN",
+        help=(
+            "Public ATS board as 'provider:token' (repeatable), e.g. "
+            "'greenhouse:stripe', 'lever:netflix', 'ashby:openai'."
+        ),
     )
     live.add_argument(
         "--user-agent",
         required=True,
-        help="SEC-required contact User-Agent, e.g. 'job-finder you@example.com'.",
+        help="Contact User-Agent, e.g. 'job-finder you@example.com' (SEC requires "
+        "a contact email when fetching filings).",
     )
     return parser
 
@@ -284,8 +390,16 @@ def main(argv: list[str] | None = None) -> int:
             extractor=RegexExtractor(),
         )
     elif args.command == "live":
-        client = EdgarClient.with_user_agent(args.user_agent)
-        companies = _live_companies(client, args.cik)
+        if not args.cik and not args.ats:
+            print("live: provide at least one --cik or --ats source.", file=sys.stderr)
+            return 2
+        companies: list[CompanyInputs] = []
+        if args.cik:
+            edgar = EdgarClient.with_user_agent(args.user_agent)
+            companies.extend(_live_companies(edgar, args.cik))
+        if args.ats:
+            ats = AtsClient.with_user_agent(args.user_agent)
+            companies.extend(_ats_companies(ats, args.ats))
         result = run_pipeline_detailed(companies)
     else:  # pragma: no cover - argparse enforces a valid command
         return 2

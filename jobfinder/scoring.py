@@ -15,11 +15,14 @@ Component weights (plan section 4):
     company_fit        0.10   how well the candidate matches this company
     recency            0.05   how fresh the freshest supporting signal is
 
-In Slice 2 only the liquidity, leadership_vacuum, recency, and (caller-supplied)
-company_fit components have sources wired in; the ATS-driven hiring_velocity and
-strategic_language components score 0 until those collectors land (Slice 5+).
-That is by design — the scorer is the stable seam; adding a source later just
-lights up a component without changing this contract.
+All six components now have sources wired in: liquidity (Form D) and
+leadership_vacuum (8-K) since Slice 2, and — as of Slice 5 — hiring_velocity and
+strategic_language, fed by the ATS hiring-pattern signals
+(``jobfinder.signals.ats_hiring``). ``company_fit`` stays caller-supplied and
+``recency`` derives from the freshest supporting signal. This validated the
+design: lighting up the ATS components required *no* change to this scorer — the
+new signal types were already mapped (see ``_HIRING_TYPES``/``_STRATEGIC_TYPES``)
+and the weights already summed to 1.0; the scorer is the stable seam.
 """
 
 from __future__ import annotations
