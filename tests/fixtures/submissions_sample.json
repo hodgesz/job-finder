@@ -1,6 +1,8 @@
 {
   "cik": "320193",
   "name": "Apple Inc.",
+  "sic": "3571",
+  "sicDescription": "Electronic Computers",
   "filings": {
     "recent": {
       "accessionNumber": ["0001140361-26-015711", "0000320193-26-000011", "0001140361-26-016000", "0000320193-26-000009"],

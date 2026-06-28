@@ -76,6 +76,27 @@ class Filing:
 
 
 @dataclass(frozen=True)
+class CompanyInfo:
+    """Entity-level firmographics from the submissions index header.
+
+    The submissions JSON carries more than the filings list: top-level fields
+    describe the *filer* itself, including its Standard Industrial
+    Classification (``sic`` + the human ``sicDescription``, e.g. "Industrial
+    Instruments For Measurement"). That description is the company's sector —
+    the heaviest dimension of the candidate-fit model — derivable from data we
+    already fetch, with no extra network call or API key.
+
+    ``sic_description`` is ``None`` when the index omits it (some filers have no
+    assigned SIC); callers treat an absent sector as neutral, never punitive.
+    """
+
+    cik: str
+    name: str = ""
+    sic: str | None = None
+    sic_description: str | None = None
+
+
+@dataclass(frozen=True)
 class RelatedPerson:
     """A related person from a Form D (officer, director, or promoter)."""
 
@@ -177,6 +198,22 @@ def parse_submissions(payload: str | dict) -> list[Filing]:
     return filings
 
 
+def parse_company_info(payload: str | dict) -> CompanyInfo:
+    """Parse the entity-level header of a submissions payload into CompanyInfo.
+
+    Reads the same JSON ``parse_submissions`` consumes, but the top-level filer
+    fields rather than the filings arrays. ``sic``/``sicDescription`` are
+    optional in the index, so missing or blank values become ``None``.
+    """
+    data = json.loads(payload) if isinstance(payload, str) else payload
+    return CompanyInfo(
+        cik=_normalize_cik(data.get("cik", "0")),
+        name=(data.get("name") or "").strip(),
+        sic=(str(data.get("sic") or "")).strip() or None,
+        sic_description=(data.get("sicDescription") or "").strip() or None,
+    )
+
+
 def _parse_amount(value: str | None) -> float | None:
     """Parse a Form D money field.
 
@@ -276,21 +313,61 @@ class EdgarClient:
         url = SUBMISSIONS_URL.format(cik10=_normalize_cik(cik))
         return parse_submissions(self._fetch(url))
 
-    def recent_8k(self, cik: str | int, *, item: str | None = None) -> list[Filing]:
+    def company_info(self, cik: str | int) -> CompanyInfo:
+        """Entity-level firmographics (name + SIC sector) for a CIK.
+
+        Reads the same submissions index as ``recent_filings`` — the filer
+        header rather than the filings arrays — so it needs no extra source.
+        """
+        url = SUBMISSIONS_URL.format(cik10=_normalize_cik(cik))
+        return parse_company_info(self._fetch(url))
+
+    def company_submissions(self, cik: str | int) -> tuple[CompanyInfo, list[Filing]]:
+        """Fetch the submissions index *once* and return both the filer info and
+        its filings.
+
+        ``company_info``, ``recent_8k`` and ``recent_form_d`` each fetch this
+        same URL; a caller that needs more than one of them (e.g. the live CLI,
+        which needs the firmographic info plus 8-K and Form D filings) should use
+        this to make a single request rather than two or three identical ones —
+        SEC enforces a fair-access rate limit. Pass the returned filings list
+        back into ``recent_8k``/``recent_form_d`` (``filings=`` keyword) to reuse
+        their filtering without re-fetching.
+        """
+        url = SUBMISSIONS_URL.format(cik10=_normalize_cik(cik))
+        data = json.loads(self._fetch(url))
+        return parse_company_info(data), parse_submissions(data)
+
+    def recent_8k(
+        self,
+        cik: str | int,
+        *,
+        item: str | None = None,
+        filings: list[Filing] | None = None,
+    ) -> list[Filing]:
         """Recent 8-K filings, optionally restricted to those disclosing `item`.
 
         Includes amendments (``8-K/A``), which can themselves disclose
         Item 5.02 events. `item` is matched from the index `items` field, so
-        this does not download any documents.
+        this does not download any documents. Pass an already-fetched `filings`
+        list (e.g. from ``company_submissions``) to filter it without re-fetching.
         """
-        filings = [f for f in self.recent_filings(cik) if f.form in ("8-K", "8-K/A")]
+        source = self.recent_filings(cik) if filings is None else filings
+        result = [f for f in source if f.form in ("8-K", "8-K/A")]
         if item is not None:
-            filings = [f for f in filings if item in f.items]
-        return filings
+            result = [f for f in result if item in f.items]
+        return result
 
-    def recent_form_d(self, cik: str | int) -> list[Filing]:
-        """Recent Form D filings (initial ``D`` and amendments ``D/A``)."""
-        return [f for f in self.recent_filings(cik) if f.form in ("D", "D/A")]
+    def recent_form_d(
+        self, cik: str | int, *, filings: list[Filing] | None = None
+    ) -> list[Filing]:
+        """Recent Form D filings (initial ``D`` and amendments ``D/A``).
+
+        Pass an already-fetched `filings` list (e.g. from
+        ``company_submissions``) to filter it without re-fetching.
+        """
+        source = self.recent_filings(cik) if filings is None else filings
+        return [f for f in source if f.form in ("D", "D/A")]
 
     def fetch_document(self, filing: Filing) -> str:
         return self._fetch(filing.primary_document_url)
