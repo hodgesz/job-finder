@@ -117,7 +117,12 @@ _PERSONA_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
             r"chief technology officer|\bCTO\b|engineering|\bplatform\b|infrastructure|software",
             "VP Engineering / Engineering leader",
         ),
-        (r"chief executive officer|\bCEO\b|president", "CEO / President"),
+        # "president" must not be preceded by "vice"/"VP": a *Vice* President is
+        # not a CEO. A bare "President" (or CEO) still maps here.
+        (
+            r"chief executive officer|\bCEO\b|(?<!vice )(?<!vice-)(?<!v )\bpresident\b",
+            "CEO / President",
+        ),
         # Broad container word, matched last: "<Function> Operations" already
         # resolved to <Function> above; only bare ops / a COO reaches here.
         (r"chief operating officer|\bCOO\b|operations|\bops\b", "COO / VP Operations"),

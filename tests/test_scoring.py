@@ -235,6 +235,32 @@ def test_derive_persona_compound_department_names(department, expected):
     assert source == "s-dept"
 
 
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        # A bare "President" (a CEO-adjacent role) maps to CEO/President...
+        ("President", "CEO / President"),
+        ("President and CEO", "CEO / President"),
+        # ...but a *Vice* President does not — the unbounded "president" token
+        # must not swallow VP titles into the CEO persona.
+        ("Vice President of Corporate Development", DEFAULT_PERSONA),
+        ("Executive Vice President", DEFAULT_PERSONA),
+    ],
+)
+def test_derive_persona_vice_president_is_not_ceo(role, expected):
+    # Drive it via an 8-K departure whose extracted role text is the title; no
+    # earlier function word (sales/eng/etc.) so it would otherwise reach the CEO
+    # rule's "president" token.
+    sig = _signal(
+        "s-vp",
+        "8k_exec_departure",
+        strength=0.6,
+        facts={"leadership_vacuum": True, "roles": [role]},
+    )
+    persona, _ = derive_persona([sig])
+    assert persona == expected
+
+
 def test_derive_persona_vacuum_wins_over_surge():
     # A CFO departure (a confirmed open seat) outranks a concurrent Engineering
     # build-out as the persona source, regardless of signal strength.
