@@ -68,6 +68,31 @@ class Filing:
         )
 
     @property
+    def primary_data_url(self) -> str:
+        """URL of the filing's machine-readable primary document.
+
+        For Form D the submissions index advertises ``primaryDocument`` as the
+        XSL-*styled* viewer (``xslFormDX08/primary_doc.xml``), which serves
+        rendered HTML, not the XML our parser expects. The raw XML lives at the
+        same path with the ``xsl…/`` styling directory stripped. For other forms
+        the document path has no such prefix, so this is identical to
+        ``primary_document_url``.
+        """
+        document = self.primary_document
+        head, _, tail = document.rpartition("/")
+        # Strip a sole leading "xsl<style>/" viewer directory (the only layout
+        # EDGAR uses), e.g. "xslFormDX08/primary_doc.xml" -> "primary_doc.xml".
+        # Requiring head to be a single segment avoids touching any genuine
+        # subdirectory that merely happens to start with "xsl".
+        if "/" not in head and head.startswith("xsl"):
+            document = tail
+        return ARCHIVES_DOC_URL.format(
+            cik=int(self.cik),
+            accession_nodash=self.accession_nodash,
+            document=document,
+        )
+
+    @property
     def index_url(self) -> str:
         return (
             f"https://www.sec.gov/Archives/edgar/data/{int(self.cik)}/"
@@ -373,6 +398,10 @@ class EdgarClient:
         return self._fetch(filing.primary_document_url)
 
     def fetch_form_d(self, filing: Filing) -> FormD:
-        """Fetch and parse a Form D filing's primary XML document."""
-        payload = self._fetch(filing.primary_document_url)
+        """Fetch and parse a Form D filing's primary XML document.
+
+        Uses ``primary_data_url`` (not ``primary_document_url``): the index
+        advertises the styled HTML viewer for Form D, but we need the raw XML.
+        """
+        payload = self._fetch(filing.primary_data_url)
         return parse_form_d(payload, accession_number=filing.accession_number)
