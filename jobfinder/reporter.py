@@ -42,6 +42,18 @@ def _age_phrase(when: datetime, now: datetime) -> str:
     return f"{int(days)} days ago"
 
 
+def _since_label(since: datetime) -> str:
+    """Render the --since cutoff for the header.
+
+    The cutoff is applied as a full UTC datetime, so show the time when it
+    carries one (a bare-date cutoff is midnight UTC -> just the date), rather
+    than always printing the date and implying midnight.
+    """
+    if (since.hour, since.minute, since.second, since.microsecond) == (0, 0, 0, 0):
+        return since.date().isoformat()
+    return since.strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _movement_tag(change: OpportunityChange, *, has_window: bool) -> str:
     """A short ``[NEW]`` / ``[↑ +0.07]`` / ``[updated]`` / ``[recurring]`` tag.
 
@@ -128,9 +140,7 @@ def render_digest(
 
     lines: list[str] = []
     if has_window:
-        header = (
-            f"Opportunity digest — what changed since {diff.since.date().isoformat()}"
-        )
+        header = f"Opportunity digest — what changed since {_since_label(diff.since)}"
     else:
         header = "Opportunity digest — current standings"
     lines.append(header)

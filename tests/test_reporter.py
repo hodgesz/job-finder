@@ -93,6 +93,19 @@ def test_since_digest_flags_new_and_lists_new_signals():
     assert "https://example.com/8k" in out
 
 
+def test_header_shows_time_when_cutoff_has_one():
+    """A --since with a time-of-day must not read like midnight in the header."""
+    store = Store.in_memory()
+    store.persist_run([_signal()], [_opportunity()], now=LATER)
+    cutoff = datetime(2026, 6, 5, 18, 0, tzinfo=timezone.utc)
+    out = render_digest(store.diff(since=cutoff), now=RENDER_NOW)
+    assert "what changed since 2026-06-05 18:00 UTC" in out
+    # A bare-date (midnight) cutoff still renders as just the date.
+    midnight = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    out2 = render_digest(store.diff(since=midnight), now=RENDER_NOW)
+    assert "what changed since 2026-06-05\n" in out2
+
+
 def test_resaved_without_score_change_reads_updated_not_recurring():
     store = Store.in_memory()
     store.save_opportunity(_opportunity(score=0.50), now=NOW)
