@@ -97,6 +97,13 @@ uv run python -m jobfinder.cli demo
 # `live` fetches real EDGAR filings (SEC requires a contact User-Agent):
 uv run python -m jobfinder.cli live --cik 320193 --user-agent "job-finder you@example.com"
 
+# Persist a run so history accumulates (--db takes a SQLite path or any
+# SQLAlchemy URL; re-runs upsert by id rather than duplicating):
+uv run python -m jobfinder.cli demo --db runs.db
+uv run python -m jobfinder.cli live --cik 320193 \
+  --user-agent "job-finder you@example.com" \
+  --db "postgresql+psycopg://user:pw@localhost/jobfinder"
+
 # Run the tests
 uv run pytest
 ```
@@ -119,8 +126,9 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] Pillar III: SEC 8-K Item 5.02 collector (EDGAR) + LLM extraction pass
 - [x] Pillar II: SEC Form D collector (EDGAR)
 - [x] Composite intent scorer + ranked-opportunity CLI demo
+- [x] Persistence layer (SQLite/Postgres via SQLAlchemy) — runs accumulate for cross-run diffing
 - [ ] Pillar I: ATS collectors (Greenhouse / Lever / Ashby)
-- [ ] Persistence (Postgres) + reporter (digest output)
+- [ ] Reporter (digest output)
 - [ ] Enrichment integrations (contacts, firmographics)
 
 ## Legal & ethical use

@@ -23,10 +23,11 @@ import argparse
 import sys
 from datetime import date, datetime, timezone
 
-from jobfinder.pipeline import CompanyInputs, run_pipeline
+from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detailed
 from jobfinder.schemas import Opportunity
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD, RelatedPerson
+from jobfinder.store import PersistResult, Store
 
 # A fixed "now" so the demo's recency scores are reproducible.
 _DEMO_NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
@@ -199,6 +200,29 @@ def render(
 
 
 # --------------------------------------------------------------------------- #
+# Persistence.
+# --------------------------------------------------------------------------- #
+def _store_url(db: str) -> str:
+    """Turn a --db argument into a SQLAlchemy URL.
+
+    A bare path or filename (``runs.db``, ``/tmp/jf.db``) becomes a local SQLite
+    URL; anything already containing a ``://`` scheme (e.g. a Postgres URL) is
+    passed through untouched, so the same flag drives both backends.
+    """
+    return db if "://" in db else f"sqlite+pysqlite:///{db}"
+
+
+def render_persistence(result: PersistResult, db: str) -> str:
+    """One-line summary of what a run wrote, distinguishing new from recurring."""
+    return (
+        f"Persisted to {db}: "
+        f"signals {result.signals_inserted} new / {result.signals_updated} updated, "
+        f"opportunities {result.opportunities_inserted} new / "
+        f"{result.opportunities_updated} updated."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # argparse wiring.
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -209,11 +233,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-n", "--top", type=int, default=5, help="How many companies to show."
     )
+
+    # Options shared by every subcommand. Kept on a parent parser so they can be
+    # given after the subcommand (`demo --db runs.db`), which reads naturally.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--db",
+        default=None,
+        help=(
+            "Persist this run's signals and opportunities. Accepts a SQLite "
+            "path ('runs.db') or any SQLAlchemy URL "
+            "('postgresql+psycopg://user:pw@host/db'). Re-runs upsert by id so "
+            "history accumulates without duplicating."
+        ),
+    )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("demo", help="Run the built-in offline demo dataset (no network).")
+    sub.add_parser(
+        "demo",
+        parents=[common],
+        help="Run the built-in offline demo dataset (no network).",
+    )
 
-    live = sub.add_parser("live", help="Fetch real filings for one or more CIKs.")
+    live = sub.add_parser(
+        "live", parents=[common], help="Fetch real filings for one or more CIKs."
+    )
     live.add_argument(
         "--cik", action="append", required=True, help="SEC CIK (repeatable)."
     )
@@ -232,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         companies = _demo_companies()
         # Force the deterministic regex extractor so the demo is reproducible
         # and offline even when a GEMINI_API_KEY is present in the environment.
-        opportunities = run_pipeline(
+        result = run_pipeline_detailed(
             companies,
             observed_at=_DEMO_NOW,
             now=_DEMO_NOW,
@@ -241,12 +286,21 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "live":
         client = EdgarClient.with_user_agent(args.user_agent)
         companies = _live_companies(client, args.cik)
-        opportunities = run_pipeline(companies)
+        result = run_pipeline_detailed(companies)
     else:  # pragma: no cover - argparse enforces a valid command
         return 2
 
-    print(render(opportunities, companies, top=args.top))
+    print(render(result.opportunities, companies, top=args.top))
+    if args.db:
+        persisted = _persist(result, args.db)
+        print()
+        print(render_persistence(persisted, args.db))
     return 0
+
+
+def _persist(result: PipelineResult, db: str) -> PersistResult:
+    store = Store(_store_url(db))
+    return store.persist_run(result.signals, result.opportunities)
 
 
 if __name__ == "__main__":  # pragma: no cover

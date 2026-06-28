@@ -10,8 +10,10 @@ dependencies = [
     "groq>=1.4.0",
     "ipykernel>=7.2.0",
     "openai>=2.38.0",
+    "psycopg[binary]>=3.2",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
+    "sqlalchemy>=2.0",
 ]
 
 [dependency-groups]

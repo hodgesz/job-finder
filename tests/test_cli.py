@@ -2,10 +2,11 @@
 
 from datetime import date, datetime, timezone
 
-from jobfinder.cli import _demo_companies, build_parser, main, render
-from jobfinder.pipeline import CompanyInputs, run_pipeline
+from jobfinder.cli import _demo_companies, _store_url, build_parser, main, render
+from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detailed
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.edgar import Filing, FormD
+from jobfinder.store import Store
 
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 
@@ -108,6 +109,65 @@ def test_main_demo_top_flag(capsys):
     out = capsys.readouterr().out
     assert "Northwind" in out
     assert "Atlas Freight" not in out
+
+
+def test_run_pipeline_detailed_returns_signals_and_opportunities():
+    result = run_pipeline_detailed(
+        _demo_companies(), observed_at=NOW, now=NOW, extractor=RegexExtractor()
+    )
+    # Same ranking as run_pipeline, plus the raw signals that produced it.
+    assert [o.company_id for o in result.opportunities] == [
+        "co-northwind",
+        "co-lumen",
+        "co-atlas",
+    ]
+    assert result.signals
+    # Every cited supporting signal is present in the returned signal list.
+    cited = {sid for o in result.opportunities for sid in o.supporting_signal_ids}
+    assert cited <= {s.id for s in result.signals}
+
+
+def test_store_url_maps_path_vs_scheme():
+    assert _store_url("runs.db") == "sqlite+pysqlite:///runs.db"
+    assert _store_url("/tmp/jf.db") == "sqlite+pysqlite:////tmp/jf.db"
+    # An explicit URL passes through untouched.
+    url = "postgresql+psycopg://u:p@host/db"
+    assert _store_url(url) == url
+
+
+def test_main_demo_persists_to_sqlite(tmp_path, capsys):
+    db = tmp_path / "runs.db"
+    code = main(["demo", "--db", str(db)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"Persisted to {db}" in out
+    assert "signals" in out and "opportunities" in out
+
+    # Re-open the same file and confirm the run actually landed.
+    store = Store(_store_url(str(db)), create=False)
+    opps = store.top_opportunities()
+    assert [o.company_id for o in opps] == ["co-northwind", "co-lumen", "co-atlas"]
+    assert store.signals_for_company("co-northwind")
+
+
+def test_main_demo_rerun_updates_not_duplicates(tmp_path, capsys):
+    db = tmp_path / "runs.db"
+    main(["demo", "--db", str(db)])
+    capsys.readouterr()
+    # Second identical run: everything upserts, nothing duplicates.
+    main(["demo", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert "updated" in out
+    store = Store(_store_url(str(db)), create=False)
+    # Three companies -> exactly three opportunities, even after two runs.
+    assert len(store.top_opportunities()) == 3
+
+
+def test_main_demo_without_db_does_not_persist(capsys):
+    code = main(["demo"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Persisted to" not in out
 
 
 def test_live_requires_user_agent():
