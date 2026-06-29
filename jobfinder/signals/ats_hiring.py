@@ -80,11 +80,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_recent(posting: JobPosting, now: datetime) -> bool:
+def is_recent(posting: JobPosting, now: datetime) -> bool:
     """True if the posting was updated within the recent window.
 
     Postings with no timestamp are conservatively treated as NOT recent — we do
     not invent freshness the provider did not give us.
+
+    Public because the listed-roles corroboration (``jobfinder.listings``) reuses
+    the same recency definition (window + future-skew clamp) when counting how
+    many live reqs are *recent*, so the two never disagree on what "recent" means.
     """
     if posting.updated_at is None:
         return False
@@ -328,7 +332,7 @@ def signals_from_board(
     # same instant rather than a second clock read so the two never disagree.
     reference = now or observed
 
-    recent = [p for p in board.postings if _is_recent(p, reference)]
+    recent = [p for p in board.postings if is_recent(p, reference)]
 
     signals: list[Signal] = []
     velocity = _velocity_signal(board, recent, company_id=company_id, observed=observed)

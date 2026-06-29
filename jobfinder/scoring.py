@@ -157,13 +157,18 @@ def _persona_fragments(signal: Signal) -> list[str]:
     return fragments
 
 
-def _match_persona(fragments: list[str]) -> str | None:
+def match_persona(fragments: list[str]) -> str | None:
     """Persona for the first fragment that matches any rule, or None.
 
     Fragments are tried in order (disclosed order), and within a fragment the
     rule table's first match wins. Trying fragment-by-fragment means the
     first-listed role/department drives the persona, so role *listing* order beats
     rule-table order when a signal carries more than one role.
+
+    Public because the listed-roles corroboration (``jobfinder.listings``) reads
+    the same persona rules to decide whether a live ATS posting is *in the same
+    function* as an opportunity's target persona — one source of truth for the
+    role->persona mapping across scoring and corroboration.
     """
     for fragment in fragments:
         for pattern, persona in _PERSONA_RULES:
@@ -192,7 +197,7 @@ def derive_persona(signals: list[Signal]) -> tuple[str, str | None]:
         for signal in sorted(
             by_type.get(signal_type, []), key=lambda s: s.strength, reverse=True
         ):
-            persona = _match_persona(_persona_fragments(signal))
+            persona = match_persona(_persona_fragments(signal))
             if persona is not None:
                 return persona, signal.id
     return DEFAULT_PERSONA, None

@@ -30,9 +30,11 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 from jobfinder.fit import CandidateProfile, Firmographics
+from jobfinder.listings import corroborate_roles, corroboration_lines
 from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detailed
 from jobfinder.reporter import render_digest
-from jobfinder.schemas import Opportunity
+from jobfinder.schemas import Opportunity, Signal
+from jobfinder.scoring import derive_persona
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.signals.form_d import FORM_D_RECENCY_HORIZON_DAYS
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
@@ -338,14 +340,48 @@ def _ats_companies(client: AtsClient, specs: list[str]) -> list[CompanyInputs]:
 # --------------------------------------------------------------------------- #
 # Rendering.
 # --------------------------------------------------------------------------- #
+def _authoritative_persona(
+    opp: Opportunity, signals_by_id: dict[str, Signal]
+) -> str | None:
+    """The opportunity's target function for in-function matching, or None.
+
+    Re-derives the persona from the opportunity's own supporting signals: when a
+    signal actually named the role, ``derive_persona`` returns its id and we trust
+    the persona as the function to corroborate against; when it falls back to the
+    scorer's DEFAULT_PERSONA (no role-bearing signal — e.g. a funding-only opp),
+    the source id is None and we return None so unrelated reqs aren't flagged
+    in-function. Mirrors how the scorer itself decided the persona, so the two
+    never disagree.
+    """
+    supporting = [
+        signals_by_id[sid] for sid in opp.supporting_signal_ids if sid in signals_by_id
+    ]
+    persona, source_id = derive_persona(supporting)
+    return persona if source_id is not None else None
+
+
 def render(
     opportunities: list[Opportunity],
     companies: list[CompanyInputs],
     *,
     top: int,
+    signals: list[Signal] | None = None,
+    now: datetime | None = None,
 ) -> str:
-    """Render ranked opportunities as a human-readable report."""
+    """Render ranked opportunities as a human-readable report.
+
+    When a company has public ATS boards on hand, each opportunity also lists the
+    live reqs that corroborate it (in-function roles first) — the hidden seat plus
+    the listed roles around it. `signals` are the run's signals; they let each
+    opportunity's *authoritative* target function be recovered (a persona is only
+    treated as a function to match against when a signal actually derived it, not
+    when it's the scorer's default fallback). `now` is the recency reference; it
+    defaults to utcnow so existing callers are unaffected.
+    """
     names = {c.company_id: (c.name or c.company_id) for c in companies}
+    boards_by_company = {c.company_id: c.ats_boards for c in companies}
+    signals_by_id = {s.id: s for s in (signals or [])}
+    reference = now or datetime.now(timezone.utc)
     lines: list[str] = []
     # The target persona is now derived per-opportunity from its signals (an
     # Engineering surge reads as an engineering leader, a CFO departure as a
@@ -372,6 +408,18 @@ def render(
         lines.append(
             f"   Evidence (supporting signals): {', '.join(opp.supporting_signal_ids)}"
         )
+        # Corroborate the hidden seat with the company's listed roles, when we
+        # have a board on hand (pure-SEC opportunities print nothing here). Only
+        # an *authoritative* (signal-derived) persona is used to match reqs
+        # in-function — a default-fallback persona (funding-only opp) would
+        # otherwise flag routine Finance reqs as a build-out that no signal implied.
+        boards = boards_by_company.get(opp.company_id, [])
+        corro = corroborate_roles(
+            boards,
+            target_persona=_authoritative_persona(opp, signals_by_id),
+            now=reference,
+        )
+        lines.extend(corroboration_lines(corro))
     return "\n".join(lines)
 
 
@@ -543,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         companies = _demo_companies()
         # Force the deterministic regex extractor so the demo is reproducible
         # and offline even when a GEMINI_API_KEY is present in the environment.
+        run_now = _DEMO_NOW
         result = run_pipeline_detailed(
             companies,
             candidate_profile=_DEMO_PROFILE,
@@ -554,10 +603,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.cik and not args.ats:
             print("live: provide at least one --cik or --ats source.", file=sys.stderr)
             return 2
-        # One reference instant for the whole run: the Form D pre-filter cutoff
-        # and the recency floor/decay the pipeline applies share it, so they
-        # can't drift across a slow multi-CIK fetch.
+        # One reference instant for the whole run: the Form D pre-filter cutoff,
+        # the recency floor/decay the pipeline applies, AND the listed-roles
+        # "opened recently" check all share it, so they can't drift across a slow
+        # multi-CIK fetch.
         now = datetime.now(timezone.utc)
+        run_now = now
         companies: list[CompanyInputs] = []
         if args.cik:
             edgar = EdgarClient.with_user_agent(args.user_agent)
@@ -577,7 +628,15 @@ def main(argv: list[str] | None = None) -> int:
     else:  # pragma: no cover - argparse enforces a valid command
         return 2
 
-    print(render(result.opportunities, companies, top=args.top))
+    print(
+        render(
+            result.opportunities,
+            companies,
+            top=args.top,
+            signals=result.signals,
+            now=run_now,
+        )
+    )
     if args.db:
         persisted = _persist(result, args.db)
         print()

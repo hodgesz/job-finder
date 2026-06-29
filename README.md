@@ -168,6 +168,7 @@ CI runs lint, format-check, and tests on every push and pull request to `main`.
 - [x] Pillar I: ATS collectors (Greenhouse / Lever / Ashby) — hiring-velocity / department-surge / greenfield-team signals, activating the `hiring_velocity` + `strategic_language` scorer components
 - [x] Reporter (cross-run digest) — `report --db [--since]` turns accumulated runs into a prioritized "what changed since last week" view (new vs recurring, score movement, newly-appeared signals)
 - [x] Firmographic `company_fit`: a candidate-vs-company fit model (`jobfinder.fit`), wired into live runs by deriving each filer's sector from its SEC SIC classification (`live --target-sector`)
+- [x] Listed-roles corroboration (`jobfinder.listings`): surfaces the public ATS reqs already fetched next to each opportunity, flagging the ones *in the same function* as the target persona — the hidden seat corroborated by live, listed roles
 - [ ] Enrichment integrations (contacts, richer firmographics — funding stage, headcount)
 
 ## Legal & ethical use
