@@ -17,6 +17,7 @@ from jobfinder.cli import (
 from jobfinder.fit import CandidateProfile
 from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detailed
 from jobfinder.signals.extraction import RegexExtractor
+from jobfinder.sources.ats import JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD
 from jobfinder.store import Store
 
@@ -110,7 +111,8 @@ def test_demo_personas_differ_by_signal():
 
 
 def test_demo_render_shows_distinct_personas():
-    out = render(_run(_demo_companies()), _demo_companies(), top=5)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=5, signals=result.signals)
     assert "Target: VP Engineering / Engineering leader" in out
     assert "Target: CFO / VP Finance" in out
     # Header no longer claims a single fixed persona.
@@ -118,8 +120,8 @@ def test_demo_render_shows_distinct_personas():
 
 
 def test_render_includes_evidence_and_why_now():
-    opps = _run(_demo_companies())
-    out = render(opps, _demo_companies(), top=5)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=5, signals=result.signals)
     assert "Northwind Robotics Inc." in out
     assert "Why now:" in out
     assert "Evidence (supporting signals):" in out
@@ -127,15 +129,109 @@ def test_render_includes_evidence_and_why_now():
     assert "0001950000-26-000003:form_d" in out
 
 
+def _detailed(companies):
+    return run_pipeline_detailed(
+        companies,
+        candidate_profile=_DEMO_PROFILE,
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
+
+
+def test_render_shows_listed_roles_corroboration():
+    # Slice 11: each opportunity surfaces the company's live ATS reqs, with the
+    # in-function ones flagged — the hidden seat corroborated by listed roles.
+    result = _detailed(_demo_companies())
+    out = render(
+        result.opportunities,
+        _demo_companies(),
+        top=5,
+        signals=result.signals,
+        now=NOW,
+    )
+    # Northwind's CFO opportunity lists its Finance reqs, in-function flagged.
+    assert "Listed roles:" in out
+    assert "in-function" in out
+    assert "Controller" in out
+    assert "Board: https://boards.greenhouse.io/northwind" in out
+
+
+def test_render_no_listed_roles_for_pure_sec_opportunity():
+    # Atlas has only an 8-K (no ATS board) -> no "Listed roles" block for it.
+    result = _detailed(_demo_companies())
+    out = render(
+        result.opportunities,
+        _demo_companies(),
+        top=5,
+        signals=result.signals,
+        now=NOW,
+    )
+    atlas_block = out.split("Atlas Freight Inc.")[1].split("Helix Labs")[0]
+    assert "Listed roles:" not in atlas_block
+
+
+def test_render_funding_only_opp_does_not_fake_in_function_roles():
+    # The code-review catch: a funding-only opportunity falls back to the scorer's
+    # DEFAULT_PERSONA ('CFO / VP Finance') with no signal behind it. Its company's
+    # routine Finance reqs must NOT be flagged in-function — that would manufacture
+    # the backfill-vs-real-role corroboration this slice exists to provide.
+    fd_filing = Filing(
+        cik="9",
+        accession_number="acc-9",
+        form="D",
+        filing_date=date(2026, 5, 1),
+        report_date=None,
+        items=[],
+        primary_document="primary_doc.xml",
+    )
+    fd = FormD(
+        issuer_cik="9",
+        issuer_name="Quattro Capital",
+        accession_number="acc-9",
+        total_amount_sold=20_000_000.0,
+        total_remaining=0.0,
+    )
+    # Only two Finance reqs -> below the department-surge threshold, so no signal
+    # derives a finance persona; the opp's persona is the default fallback.
+    board = JobBoard(
+        provider="greenhouse",
+        token="quattro",
+        url="https://boards.greenhouse.io/quattro",
+        postings=[
+            JobPosting(id="1", title="Senior Accountant", department="Finance"),
+            JobPosting(id="2", title="Controller", department="Finance"),
+        ],
+    )
+    company = CompanyInputs(
+        company_id="co-q",
+        name="Quattro Capital",
+        form_d=[(fd_filing, fd)],
+        ats_boards=[board],
+    )
+    result = _detailed([company])
+    opp = result.opportunities[0]
+    # Persona is the default fallback (not signal-derived).
+    assert opp.target_persona == "CFO / VP Finance"
+    assert "inferred from signal" not in opp.why_now
+    out = render(
+        result.opportunities, [company], top=5, signals=result.signals, now=NOW
+    )
+    # The reqs are still listed (2 live) but none flagged in-function.
+    assert "Listed roles: 2 live" in out
+    assert "0 in-function" in out
+    assert "[in-function" not in out
+
+
 def test_render_respects_top_n():
-    opps = _run(_demo_companies())
-    out = render(opps, _demo_companies(), top=1)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=1, signals=result.signals)
     assert "1. Northwind" in out
     assert "Lumen Bio Corp." not in out
 
 
 def test_render_handles_no_opportunities():
-    out = render([], [], top=5)
+    out = render([], [], top=5, signals=[])
     assert "No qualifying opportunities found." in out
 
 
