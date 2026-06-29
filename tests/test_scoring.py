@@ -6,6 +6,7 @@ import pytest
 
 from jobfinder.scoring import (
     DEFAULT_PERSONA,
+    SUCCESSOR_NAMED_DAMPING,
     WEIGHTS,
     build_opportunity,
     derive_persona,
@@ -93,6 +94,41 @@ def test_vacuum_with_named_successor_scores_lower_than_open_search():
     assert "open search" in open_score.note
 
 
+def test_named_successor_departure_is_damped_to_a_fraction_of_strength():
+    # A successor-named departure is a routine backfill: its leadership-vacuum
+    # contribution is damped to SUCCESSOR_NAMED_DAMPING * strength, not full.
+    filled = _signal(
+        "s-filled",
+        "8k_exec_departure",
+        strength=0.4,
+        facts={"leadership_vacuum": False},
+    )
+    comp = score_company("co-1", [filled], now=NOW).component("leadership_vacuum")
+    assert comp.raw == pytest.approx(0.4 * SUCCESSOR_NAMED_DAMPING, abs=1e-6)
+    assert "routine backfill" in comp.note
+
+
+def test_genuine_vacuum_outranks_a_stronger_on_paper_backfill():
+    # The backfill has higher *raw* strength, but after damping the genuine
+    # no-successor vacuum must win selection AND report the higher score, so a
+    # routine backfill can never top the leadership component on its own.
+    open_search = _signal(
+        "s-open", "8k_exec_departure", strength=0.5, facts={"leadership_vacuum": True}
+    )
+    filled = _signal(
+        "s-filled",
+        "8k_exec_departure",
+        strength=0.9,  # stronger on paper, but a successor was named
+        facts={"leadership_vacuum": False},
+    )
+    comp = score_company("co-1", [open_search, filled], now=NOW).component(
+        "leadership_vacuum"
+    )
+    assert comp.signal_ids == ["s-open"]  # the genuine vacuum is selected
+    assert comp.raw == pytest.approx(0.5, abs=1e-6)
+    assert "open search" in comp.note
+
+
 def test_recency_decays_with_age():
     fresh = _signal("s-fresh", "form_d_funding", strength=0.9, effective=NOW)
     old = _signal(
@@ -148,6 +184,33 @@ def test_build_opportunity_cites_signals_and_sets_persona():
     assert "Concurrent signals" in opp.why_now
     assert 0.0 <= opp.score <= 1.0
     assert opp.urgency > 0  # vacuum + fresh signal drives urgency
+
+
+def test_named_successor_departure_is_less_urgent_than_open_search():
+    # urgency = 0.6*vacuum + 0.4*recency reads the DAMPED vacuum raw, so an
+    # equally-fresh routine backfill must be less urgent than a true open
+    # search — the damping carries through to urgency, not just the score.
+    open_search = _signal(
+        "s-open",
+        "8k_exec_departure",
+        strength=0.75,
+        effective=NOW,
+        facts={"leadership_vacuum": True, "roles": ["CFO"]},
+    )
+    filled = _signal(
+        "s-filled",
+        "8k_exec_departure",
+        strength=0.75,  # same on-paper strength; differs only in successor named
+        effective=NOW,
+        facts={"leadership_vacuum": False, "roles": ["CFO"]},
+    )
+    open_opp = build_opportunity(
+        score_company("co-open", [open_search], now=NOW), signals=[open_search]
+    )
+    filled_opp = build_opportunity(
+        score_company("co-filled", [filled], now=NOW), signals=[filled]
+    )
+    assert filled_opp.urgency < open_opp.urgency
 
 
 def test_derive_persona_from_cfo_departure():

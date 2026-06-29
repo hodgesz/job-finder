@@ -58,6 +58,26 @@ _STRATEGIC_TYPES = {"greenfield_team", "tech_stack_change"}
 # searches move on a months-not-years horizon; ~120 days is a generous window.
 RECENCY_HORIZON_DAYS = 120.0
 
+# A departure that names a successor in the same filing is a *routine backfill*:
+# the seat is already being filled, so the "hidden forming role" intent — the
+# whole premise of the system — is weak. Live validation against real
+# early-growth 8-Ks showed these named-successor departures dominating rankings
+# even though an announced successor is the opposite of an open search. We damp
+# the leadership-vacuum *contribution* of a named-successor departure so a
+# genuine no-successor vacuum clearly outranks it and a backfill no longer tops
+# the board on its own.
+#
+# COMPOUNDS WITH THE SIGNAL LAYER — read before retuning either knob: the 8-K
+# extractor (`jobfinder.signals.sec_8k.signals_from_filing`) already emits a
+# lower *signal* strength for a named-successor departure (0.4) than for a
+# vacuum (0.75). That earlier penalty (a ~0.53x ratio) was NOT enough on live
+# data, so this damping is applied deliberately ON TOP of it, here in the
+# scorer — the project's stable tuning seam. Net effective backfill vacuum-raw
+# is therefore 0.4 (signal) * 0.4 (this) = 0.16 → contribution 0.16*0.25 = 0.04,
+# vs a fresh vacuum's up-to 0.75*0.25 = 0.1875. Changing the 0.4 in sec_8k.py
+# moves the first factor; this constant moves the second.
+SUCCESSOR_NAMED_DAMPING = 0.4
+
 # Persona used when no supporting signal names a role or department of its own
 # (e.g. a funding-only opportunity — capital raised is a liquidity signal, not a
 # persona source). Also the explicit override fallback for `build_opportunity`.
@@ -255,23 +275,40 @@ def _max_strength(signals: list[Signal], types: set[str]) -> tuple[float, list[s
     return best.strength, [best.id]
 
 
+def _vacuum_effective_strength(signal: Signal) -> float:
+    """The leadership-vacuum strength a departure contributes, after damping.
+
+    A departure with a named successor is a routine backfill — the seat is
+    already being filled — so its vacuum strength is damped by
+    ``SUCCESSOR_NAMED_DAMPING``. A no-successor departure (an open search)
+    contributes its full strength.
+    """
+    if signal.extracted_facts.get("leadership_vacuum"):
+        return signal.strength
+    return signal.strength * SUCCESSOR_NAMED_DAMPING
+
+
 def _vacuum_score(signals: list[Signal]) -> tuple[float, list[str], str]:
     """Leadership-vacuum component.
 
     A departure flagged as a leadership_vacuum (no named successor) is the
-    high-value case; a departure *with* a successor still counts, but weakly.
+    high-value case; a departure *with* a successor is a routine backfill that
+    still counts, but heavily damped (see ``SUCCESSOR_NAMED_DAMPING``). We pick
+    the departure with the strongest *effective* (post-damping) strength so a
+    genuine open search outranks a stronger-on-paper but already-filled seat,
+    then report that damped strength as the component's raw score.
     """
     departures = [s for s in signals if s.signal_type in _VACUUM_TYPES]
     if not departures:
         return 0.0, [], "no executive departure on file"
-    best = max(departures, key=lambda s: s.strength)
+    best = max(departures, key=_vacuum_effective_strength)
     is_vacuum = bool(best.extracted_facts.get("leadership_vacuum"))
     note = (
         "departure with no named successor (open search)"
         if is_vacuum
-        else "departure, but a successor was named"
+        else "departure, but a successor was named (routine backfill)"
     )
-    return best.strength, [best.id], note
+    return _vacuum_effective_strength(best), [best.id], note
 
 
 def _recency_score(signals: list[Signal], now: datetime) -> tuple[float, list[str]]:
