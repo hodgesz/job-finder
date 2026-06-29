@@ -86,7 +86,9 @@ _LEADERSHIP_RE = re.compile(
 # personas, not to "is this a routine back-office function".
 _SUPPORT_FUNCTION_RE = re.compile(
     r"\b("
-    r"learning\s*(?:&|and)\s*\w+|l\s*&\s*d|"  # L&D / "Learning & Quality" (not "Machine Learning")
+    # L&D phrasing, EITHER order ("Learning & Quality" / "Quality and Learning"
+    # / "L&D") — but never a bare "Learning" (would swallow "Machine Learning").
+    r"learning\s*(?:&|and)\s*\w+|\w+\s*(?:&|and)\s*learning|l\s*&\s*d|"
     r"training|enablement|"
     r"helpdesk|help\s+desk|service\s+desk|it\s+support|technical\s+support|"
     r"facilities|workplace|real\s+estate|office\s+management|"

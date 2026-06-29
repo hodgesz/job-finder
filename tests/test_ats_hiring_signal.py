@@ -187,6 +187,22 @@ def test_support_word_in_department_does_not_suppress_core_title():
     assert greenfield[0].extracted_facts["department"] == "Workplace"
 
 
+def test_reversed_l_and_d_phrasing_is_not_greenfield():
+    # Bugbot #1: the L&D denylist must catch the support function in EITHER word
+    # order — "Quality & Learning" is the same routine org as "Learning & Quality"
+    # and must also be suppressed (a bare "quality" token was deliberately not
+    # added, so order-independent L&D phrasing is what catches the reversed form).
+    board = _board(
+        [
+            _posting("s1", "Head of Quality & Learning", department="Delivery Center"),
+            _posting("e1", "Backend Engineer", department="Engineering"),
+            _posting("e2", "Frontend Engineer", department="Engineering"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    assert "greenfield_team" not in _by_type(signals)
+
+
 def test_lone_head_of_core_function_still_greenfield():
     # The denylist is permissive: a lone "Head of …" in a genuine product/GTM
     # function not on the support denylist still reads as a forming seat. (Data
@@ -210,6 +226,7 @@ def test_core_technical_titles_with_collision_words_still_greenfield():
     # "Data Quality", "Developer Support" all read as forming functions.
     for title, dept in [
         ("Head of Machine Learning", "AI"),
+        ("Head of AI & Machine Learning", "AI"),
         ("Head of Data Quality", "Data Platform"),
         ("Head of Developer Support", "Engineering"),
     ]:
