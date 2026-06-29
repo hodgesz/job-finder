@@ -84,11 +84,18 @@ class RoleCorroboration:
 def _posting_persona(posting: JobPosting) -> str | None:
     """The persona a posting reads as, via the shared scorer rules.
 
-    Fragments are tried title-first (the role itself is the strongest signal),
-    then department/team, mirroring how ``scoring`` matches role text. Location
-    is intentionally excluded — a place name must not match a persona rule.
+    Fragment order mirrors ``scoring._persona_fragments`` for ATS signals
+    (``[department, posting_title]``) so a posting is read the *same way* the
+    scorer read it when deriving the opportunity's persona: department/team first
+    (the ATS hiring signals fold team into ``department`` as
+    ``department or team``), then the title. This matters because for the
+    dominant ATS case the opportunity persona is derived from the department, so
+    a posting that *drove* that opportunity must be flagged in-function rather
+    than diverging on its title. Location is excluded — a place name must not
+    match a persona rule.
     """
-    fragments = [f for f in (posting.title, posting.department, posting.team) if f]
+    where = posting.department or posting.team
+    fragments = [f for f in (where, posting.title) if f]
     return match_persona(fragments)
 
 

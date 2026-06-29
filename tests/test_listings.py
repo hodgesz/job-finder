@@ -89,15 +89,25 @@ def test_none_target_flags_nothing_in_function():
     assert all(not r.in_function for r in corro.sample)
 
 
-def test_in_function_uses_title_over_department():
-    # A "Revenue Operations" req sitting in a Finance department reads as sales
-    # (CRO) by title, NOT finance — the shared persona table matches title-first,
-    # exactly as the scorer does.
+def test_in_function_matches_department_first_like_scorer():
+    # A "Revenue Operations Lead" req sitting in a Finance department reads as
+    # finance (CFO) by its DEPARTMENT, not sales by its title — the persona is
+    # matched department-first, exactly as scoring._persona_fragments orders ATS
+    # fragments. This keeps a posting that *drove* a department-surge opportunity
+    # flagged in-function for that opportunity rather than diverging on its title.
     board = _board([_posting("1", "Revenue Operations Lead", department="Finance")])
     corro = corroborate_roles([board], target_persona="CFO / VP Finance", now=NOW)
-    assert corro.in_function == 0
+    assert corro.in_function == 1
     corro_sales = corroborate_roles([board], target_persona="CRO / VP Sales", now=NOW)
-    assert corro_sales.in_function == 1
+    assert corro_sales.in_function == 0
+
+
+def test_in_function_falls_back_to_title_when_no_department():
+    # With no department/team, the title is the only fragment, so a "Revenue
+    # Operations Lead" with no department reads as sales (CRO) by title.
+    board = _board([_posting("1", "Revenue Operations Lead")])
+    corro = corroborate_roles([board], target_persona="CRO / VP Sales", now=NOW)
+    assert corro.in_function == 1
 
 
 def test_sample_orders_in_function_then_recent_then_title():
