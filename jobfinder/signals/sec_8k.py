@@ -290,6 +290,9 @@ def signals_from_filing(
                 evidence=evidence,
                 confidence=confidence,
                 # A vacuum is the higher-value signal; weight strength accordingly.
+                # NOTE: this 0.4 is only the FIRST backfill penalty. The scorer
+                # damps a named-successor departure AGAIN by SUCCESSOR_NAMED_DAMPING
+                # (see jobfinder.scoring) — the two factors compound by design.
                 strength=0.75 if vacuum else 0.4,
             )
         )
