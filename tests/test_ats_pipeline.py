@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from jobfinder.cli import _ats_companies, _parse_ats_spec, build_parser, main
+from jobfinder.cli import (
+    CompanySpec,
+    _build_company,
+    _parse_ats_spec,
+    build_parser,
+    main,
+)
 from jobfinder.pipeline import CompanyInputs, run_pipeline_detailed
 from jobfinder.scoring import score_company
 from jobfinder.sources.ats import AtsClient, JobBoard, JobPosting
@@ -55,19 +61,24 @@ def test_parse_ats_spec_valid_and_invalid():
         _parse_ats_spec("greenhouse:")
 
 
-def test_ats_companies_builds_from_injected_client():
+def test_build_company_board_only_from_injected_client():
     client = AtsClient(lambda _url: '{"jobs": []}')
-    companies = _ats_companies(client, ["greenhouse:acme"])
-    assert len(companies) == 1
-    assert companies[0].company_id == "ats-greenhouse-acme"
-    assert companies[0].ats_boards[0].provider == "greenhouse"
+    company = _build_company(
+        CompanySpec(ats=[("greenhouse", "acme")]),
+        edgar=None,
+        ats_client=client,
+        now=NOW,
+    )
+    assert company.company_id == "ats-greenhouse-acme"
+    assert company.name == "acme (greenhouse)"
+    assert company.ats_boards[0].provider == "greenhouse"
 
 
 def test_live_requires_at_least_one_source(capsys):
     code = main(["live", "--user-agent", "job-finder test@example.com"])
     assert code == 2
     err = capsys.readouterr().err
-    assert "at least one --cik or --ats" in err
+    assert "at least one --cik, --ats or --company" in err
 
 
 def test_live_accepts_ats_without_cik():

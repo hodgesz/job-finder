@@ -1,12 +1,18 @@
 """Tests for the pipeline wiring and the CLI demo (offline)."""
 
+import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from jobfinder.cli import (
     _DEMO_PROFILE,
+    CompanySpec,
+    _build_company,
     _demo_companies,
-    _live_companies,
+    _live_specs,
+    _parse_company_spec,
     _parse_since,
     _profile_from_args,
     _store_url,
@@ -17,7 +23,7 @@ from jobfinder.cli import (
 from jobfinder.fit import CandidateProfile
 from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detailed
 from jobfinder.signals.extraction import RegexExtractor
-from jobfinder.sources.ats import JobBoard, JobPosting
+from jobfinder.sources.ats import AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD
 from jobfinder.store import Store
 
@@ -462,6 +468,19 @@ def _edgar_fetcher(url: str) -> str:
     return (FIXTURES / "8k_item502_apple.txt").read_text()
 
 
+def _live_companies(client, ciks, *, now):
+    """Build one CIK-only company per CIK via the real assembler (test helper).
+
+    The production CLI assembles companies through `_build_company` from
+    `CompanySpec`s; these Slice-9 firmographics tests only need the CIK path, so
+    this drives the same assembler with cik-only specs.
+    """
+    return [
+        _build_company(CompanySpec(cik=cik), edgar=client, ats_client=None, now=now)
+        for cik in ciks
+    ]
+
+
 def test_live_company_derives_firmographics_and_real_name():
     companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"], now=NOW)
     assert len(companies) == 1
@@ -587,3 +606,271 @@ def test_profile_from_args_size_only():
     profile = _profile_from_args(args)
     assert profile is not None
     assert profile.min_employees == 10
+
+
+# --------------------------------------------------------------------------- #
+# Slice 12: live CIK<->ATS join (the --company spec).
+# --------------------------------------------------------------------------- #
+def test_parse_company_spec_joins_cik_and_ats():
+    spec = _parse_company_spec("cik=320193,ats=greenhouse:acme")
+    assert spec.cik == "320193"
+    assert spec.ats == [("greenhouse", "acme")]
+    # The legal entity (CIK) drives the joined company's id.
+    assert spec.company_id == "cik-320193"
+
+
+def test_parse_company_spec_cik_only_and_ats_only():
+    cik_only = _parse_company_spec("cik=1950000")
+    assert cik_only.cik == "1950000" and cik_only.ats == []
+    ats_only = _parse_company_spec("ats=lever:helix")
+    assert ats_only.cik is None and ats_only.ats == [("lever", "helix")]
+    # A board-only spec names itself by its first board.
+    assert ats_only.company_id == "ats-lever-helix"
+
+
+def test_parse_company_spec_allows_multiple_boards():
+    spec = _parse_company_spec("cik=42,ats=greenhouse:a,ats=lever:b")
+    assert spec.cik == "42"
+    assert spec.ats == [("greenhouse", "a"), ("lever", "b")]
+
+
+def test_parse_company_spec_rejects_bad_input():
+    # No sources.
+    with pytest.raises(ValueError, match="names no sources"):
+        _parse_company_spec("")
+    # Two CIKs (a company has one legal entity).
+    with pytest.raises(ValueError, match="more than one cik"):
+        _parse_company_spec("cik=1,cik=2")
+    # Unknown key.
+    with pytest.raises(ValueError, match="unknown key"):
+        _parse_company_spec("foo=bar")
+    # Malformed part (no '=').
+    with pytest.raises(ValueError, match="must be 'key=value'"):
+        _parse_company_spec("cik")
+    # Bad ATS provider bubbles up from _parse_ats_spec.
+    with pytest.raises(ValueError, match="--ats"):
+        _parse_company_spec("ats=notaprovider:x")
+
+
+def test_live_specs_rejects_duplicate_company_id():
+    # Regression: a --company joining a CIK to a board, plus a standalone --cik for
+    # the SAME CIK, both resolve to company_id 'cik-320193'. The pipeline buckets
+    # signals by company_id and render keys boards by it, so a collision would
+    # silently merge signals and drop one record's boards — losing the very
+    # corroboration the join provides. _live_specs must reject it up front.
+    args = build_parser().parse_args(
+        [
+            "live",
+            "--company",
+            "cik=320193,ats=greenhouse:acme",
+            "--cik",
+            "320193",
+            "--user-agent",
+            "jf you@example.com",
+        ]
+    )
+    with pytest.raises(ValueError, match="more than one source flag"):
+        _live_specs(args)
+
+
+def test_live_specs_rejects_empty_cik():
+    # Regression: an empty --cik would build CompanySpec(cik="") which selects the
+    # SEC branch (`cik is not None`) yet fetches an empty CIK. Caught up front.
+    args = build_parser().parse_args(
+        ["live", "--cik", "", "--user-agent", "jf you@example.com"]
+    )
+    with pytest.raises(ValueError, match="non-empty SEC CIK"):
+        _live_specs(args)
+
+
+def test_main_live_empty_cik_exits_2(capsys):
+    code = main(["live", "--cik", "", "--user-agent", "jf you@example.com"])
+    assert code == 2
+    assert "non-empty SEC CIK" in capsys.readouterr().err
+
+
+def test_live_specs_orders_company_then_standalone():
+    args = build_parser().parse_args(
+        [
+            "live",
+            "--company",
+            "cik=1,ats=greenhouse:a",
+            "--cik",
+            "2",
+            "--ats",
+            "lever:b",
+            "--user-agent",
+            "jf you@example.com",
+        ]
+    )
+    specs = _live_specs(args)
+    # Joined company first, then the standalone --cik, then the standalone --ats.
+    assert [s.company_id for s in specs] == ["cik-1", "cik-2", "ats-lever-b"]
+    assert specs[0].cik == "1" and specs[0].ats == [("greenhouse", "a")]
+
+
+def _cfo_join_fetcher(board_dept: str = "Finance"):
+    """A fetcher routing the joined-company URLs to fixtures/inline data offline.
+
+    Returns a CFO-departure 8-K for the SEC side and a one-board greenhouse JSON
+    whose reqs sit in `board_dept`, so the join's in-function corroboration can be
+    asserted (Finance reqs corroborate a CFO vacuum; Sales reqs do not).
+    """
+    cfo_8k = (
+        "Item 5.02 Departure of Directors or Certain Officers. On May 1, 2026, "
+        "Dana Wells, the Chief Financial Officer of Helix Robotics Inc., notified "
+        "the Board of her resignation, effective May 15, 2026. The Company has "
+        "commenced a search for a permanent successor."
+    )
+    board = json.dumps(
+        {
+            "jobs": [
+                {
+                    "id": 1,
+                    "title": "Controller",
+                    "updated_at": "2026-05-20T10:00:00-04:00",
+                    "absolute_url": "https://boards.greenhouse.io/helix/jobs/1",
+                    "departments": [{"id": 1, "name": board_dept}],
+                },
+                {
+                    "id": 2,
+                    "title": "FP&A Manager",
+                    "updated_at": "2026-05-18T10:00:00-04:00",
+                    "absolute_url": "https://boards.greenhouse.io/helix/jobs/2",
+                    "departments": [{"id": 1, "name": board_dept}],
+                },
+            ]
+        }
+    )
+
+    def fetcher(url: str) -> str:
+        if "greenhouse.io" in url or "lever.co" in url or "ashbyhq.com" in url:
+            return board
+        if "/submissions/" in url:
+            return (FIXTURES / "submissions_sample.json").read_text()
+        return cfo_8k
+
+    return fetcher
+
+
+def test_build_company_joins_sec_and_ats_on_one_record():
+    # The motivating gap: a CIK and an ATS board must land on ONE CompanyInputs.
+    fetcher = _cfo_join_fetcher()
+    spec = CompanySpec(cik="320193", ats=[("greenhouse", "helix")])
+    company = _build_company(
+        spec,
+        edgar=EdgarClient(fetcher),
+        ats_client=AtsClient(fetcher),
+        now=NOW,
+    )
+    # Both sources on the single record, keyed by the CIK.
+    assert company.company_id == "cik-320193"
+    assert company.eight_k  # the CFO-departure 8-K
+    assert len(company.ats_boards) == 1
+    assert company.ats_boards[0].postings  # the Finance reqs
+    # Firmographics still derived from the SEC side.
+    assert company.firmographics is not None
+    assert company.firmographics.sector == "Electronic Computers"
+
+
+def test_joined_company_corroborates_sec_opportunity_with_live_reqs():
+    # The flagship Slice-11 use case, now firing in LIVE mode: an 8-K CFO vacuum
+    # corroborated by THAT SAME company's live Finance reqs. Previously impossible
+    # live (CIK and ATS were separate companies); the join makes it work.
+    fetcher = _cfo_join_fetcher(board_dept="Finance")
+    spec = _parse_company_spec("cik=320193,ats=greenhouse:helix")
+    company = _build_company(
+        spec, edgar=EdgarClient(fetcher), ats_client=AtsClient(fetcher), now=NOW
+    )
+    result = run_pipeline_detailed(
+        [company], observed_at=NOW, now=NOW, extractor=RegexExtractor()
+    )
+    out = render(
+        result.opportunities, [company], top=5, signals=result.signals, now=NOW
+    )
+    # The SEC-sourced CFO opportunity now shows its live Finance reqs in-function.
+    assert "Listed roles:" in out
+    assert "2 in-function" in out
+    assert "Controller" in out
+
+
+def test_joined_company_off_function_reqs_not_flagged():
+    # Same join, but the board's reqs are Sales, not Finance: they're listed as
+    # corroboration but NOT flagged in-function against the CFO vacuum — the exact
+    # backfill-vs-real-role distinction the join exists to enable live.
+    fetcher = _cfo_join_fetcher(board_dept="Sales")
+    spec = _parse_company_spec("cik=320193,ats=greenhouse:helix")
+    company = _build_company(
+        spec, edgar=EdgarClient(fetcher), ats_client=AtsClient(fetcher), now=NOW
+    )
+    result = run_pipeline_detailed(
+        [company], observed_at=NOW, now=NOW, extractor=RegexExtractor()
+    )
+    out = render(
+        result.opportunities, [company], top=5, signals=result.signals, now=NOW
+    )
+    assert "Listed roles:" in out
+    assert "0 in-function" in out
+
+
+def test_main_live_company_flag_end_to_end(capsys, monkeypatch):
+    # End-to-end through main(): --company builds clients lazily and joins sources.
+    fetcher = _cfo_join_fetcher()
+    monkeypatch.setattr(
+        EdgarClient, "with_user_agent", classmethod(lambda cls, ua: cls(fetcher))
+    )
+    monkeypatch.setattr(
+        AtsClient, "with_user_agent", classmethod(lambda cls, ua: cls(fetcher))
+    )
+    code = main(
+        [
+            "live",
+            "--company",
+            "cik=320193,ats=greenhouse:helix",
+            "--user-agent",
+            "jf you@example.com",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Listed roles:" in out
+    assert "in-function" in out
+
+
+def test_main_live_company_bad_spec_exits_2(capsys):
+    code = main(
+        ["live", "--company", "cik=1,cik=2", "--user-agent", "jf you@example.com"]
+    )
+    assert code == 2
+    assert "more than one cik" in capsys.readouterr().err
+
+
+def test_standalone_cik_and_ats_still_single_source(capsys, monkeypatch):
+    # Back-compat: standalone --cik and --ats stay separate single-source
+    # companies (no implicit join), so existing usage is unchanged.
+    fetcher = _cfo_join_fetcher()
+    monkeypatch.setattr(
+        EdgarClient, "with_user_agent", classmethod(lambda cls, ua: cls(fetcher))
+    )
+    monkeypatch.setattr(
+        AtsClient, "with_user_agent", classmethod(lambda cls, ua: cls(fetcher))
+    )
+    code = main(
+        [
+            "live",
+            "--cik",
+            "320193",
+            "--ats",
+            "greenhouse:helix",
+            "--user-agent",
+            "jf you@example.com",
+        ]
+    )
+    assert code == 0
+    # The SEC company stands alone with NO board joined to it: no implicit join
+    # happened, so its opportunity shows no listed-roles corroboration (that's the
+    # whole reason --company exists). The board-only company has too few reqs to
+    # surge into an opportunity, so it's correctly dropped.
+    out = capsys.readouterr().out
+    assert "Apple Inc." in out  # the SEC-sourced company (real entity name)
+    assert "Listed roles:" not in out  # the board was not joined to the CIK
