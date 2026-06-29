@@ -86,9 +86,14 @@ _LEADERSHIP_RE = re.compile(
 # personas, not to "is this a routine back-office function".
 _SUPPORT_FUNCTION_RE = re.compile(
     r"\b("
-    # L&D phrasing, EITHER order ("Learning & Quality" / "Quality and Learning"
-    # / "L&D") — but never a bare "Learning" (would swallow "Machine Learning").
-    r"learning\s*(?:&|and)\s*\w+|\w+\s*(?:&|and)\s*learning|l\s*&\s*d|"
+    # "Learning & Development" (L&D) and its real-world variants — "learning"
+    # joined (either order) to an L&D COMPANION noun, plus the "L&D" initialism.
+    # Bound to the companion set on purpose: a bare "learning", or "learning"
+    # next to an arbitrary word, would swallow technical disciplines like
+    # "Machine Learning & Platform" / "Deep Learning & Research" (Bugbot finding).
+    r"learning\s*(?:&|and)\s*(?:development|quality|enablement|training|education)|"
+    r"(?:development|quality|enablement|training|education)\s*(?:&|and)\s*learning|"
+    r"l\s*&\s*d|"
     r"training|enablement|"
     r"helpdesk|help\s+desk|service\s+desk|it\s+support|technical\s+support|"
     r"facilities|workplace|real\s+estate|office\s+management|"

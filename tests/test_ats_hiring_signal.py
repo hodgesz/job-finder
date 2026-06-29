@@ -227,6 +227,10 @@ def test_core_technical_titles_with_collision_words_still_greenfield():
     for title, dept in [
         ("Head of Machine Learning", "AI"),
         ("Head of AI & Machine Learning", "AI"),
+        # "Learning" next to an arbitrary (non-L&D) word is a technical
+        # discipline, not L&D — must still fire (Bugbot Medium finding).
+        ("Head of Machine Learning & Platform", "AI"),
+        ("Head of Deep Learning & Research", "AI"),
         ("Head of Data Quality", "Data Platform"),
         ("Head of Developer Support", "Engineering"),
     ]:
