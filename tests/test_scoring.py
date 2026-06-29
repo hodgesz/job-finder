@@ -168,6 +168,49 @@ def test_unwired_components_score_zero():
     assert breakdown.component("strategic_language").raw == 0.0
 
 
+def test_appointment_only_company_yields_no_opportunity():
+    # An 8-K appointment (someone JOINING) is the opposite of a vacuum and feeds
+    # no intent component. Before the intent gate, `recency` alone cited its id
+    # and surfaced a urgency-0% opp ("ranked on baseline fit only"); it must now
+    # be skipped entirely.
+    appointment = _signal(
+        "s-appt",
+        "8k_exec_appointment",
+        strength=0.5,
+        facts={"roles": ["CEO"]},
+    )
+    ranked = rank_opportunities({"co-appt": [appointment]}, now=NOW)
+    assert ranked == []
+
+
+def test_appointment_does_not_resurrect_opportunity_via_recency():
+    # Even paired with a high company_fit (a modifier, not intent), an
+    # appointment-only company stays off the board.
+    appointment = _signal("s-appt", "8k_exec_appointment", strength=0.5)
+    ranked = rank_opportunities(
+        {"co-appt": [appointment]},
+        company_fit={"co-appt": 0.95},
+        now=NOW,
+    )
+    assert ranked == []
+
+
+def test_appointment_alongside_departure_still_yields_opportunity():
+    # The gate blocks *appointment-only* companies, not appointments in general:
+    # a genuine departure that also names an appointment is still an opportunity
+    # (and the appointment remains valid evidence).
+    departure = _signal(
+        "s-dep",
+        "8k_exec_departure",
+        strength=0.75,
+        facts={"leadership_vacuum": True, "roles": ["CFO"]},
+    )
+    appointment = _signal("s-appt", "8k_exec_appointment", strength=0.5)
+    ranked = rank_opportunities({"co-1": [departure, appointment]}, now=NOW)
+    assert len(ranked) == 1
+    assert "s-dep" in ranked[0].supporting_signal_ids
+
+
 def test_build_opportunity_cites_signals_and_sets_persona():
     funding = _signal("s-fund", "form_d_funding", strength=0.9)
     vacuum = _signal(
