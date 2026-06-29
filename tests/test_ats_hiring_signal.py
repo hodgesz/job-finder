@@ -142,6 +142,107 @@ def test_greenfield_lone_leadership_req_fires():
     assert g.strength == 0.6
 
 
+def test_lone_head_of_support_function_is_not_greenfield():
+    # Live finding D: "Head of Learning & Quality" is a routine support/ops org,
+    # not a zero-to-one team — the lone-leadership heuristic must NOT fire even
+    # though it is a solitary "Head of …" req with no team beneath it.
+    board = _board(
+        [
+            _posting("s1", "Head of Learning & Quality", department="Delivery Center"),
+            _posting("e1", "Backend Engineer", department="Engineering"),
+            _posting("e2", "Frontend Engineer", department="Engineering"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    assert "greenfield_team" not in _by_type(signals)
+
+
+def test_lone_head_of_it_support_title_is_not_greenfield():
+    # A support function named in the TITLE (IT/service desk) is routine structure.
+    board = _board(
+        [
+            _posting("s1", "Head of Service Desk", department="IT Operations"),
+            _posting("e1", "Backend Engineer", department="Engineering"),
+            _posting("e2", "Frontend Engineer", department="Engineering"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    assert "greenfield_team" not in _by_type(signals)
+
+
+def test_support_word_in_department_does_not_suppress_core_title():
+    # The denylist is matched against the TITLE only: a support word in the
+    # DEPARTMENT label (e.g. "Workplace") must NOT veto a genuine core-function
+    # leadership title — otherwise we trade finding D for dropping real seats.
+    board = _board(
+        [
+            _posting("p1", "Head of Engineering", department="Workplace"),
+            _posting("d1", "Data Analyst", department="Data"),
+            _posting("d2", "Data Engineer", department="Data"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    greenfield = _by_type(signals)["greenfield_team"]
+    assert len(greenfield) == 1
+    assert greenfield[0].extracted_facts["department"] == "Workplace"
+
+
+def test_lone_head_of_core_function_still_greenfield():
+    # The denylist is permissive: a lone "Head of …" in a genuine product/GTM
+    # function not on the support denylist still reads as a forming seat. (Data
+    # is covered by test_greenfield_lone_leadership_req_fires; check another.)
+    board = _board(
+        [
+            _posting("p1", "Head of Growth", department="Growth"),
+            _posting("e1", "Backend Engineer", department="Engineering"),
+            _posting("e2", "Frontend Engineer", department="Engineering"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    greenfield = _by_type(signals)["greenfield_team"]
+    assert len(greenfield) == 1
+    assert greenfield[0].extracted_facts["department"] == "Growth"
+
+
+def test_core_technical_titles_with_collision_words_still_greenfield():
+    # Tokens were tightened so genuine technical/GTM seats whose titles merely
+    # CONTAIN a support-ish word are NOT suppressed: "Machine Learning" (not L&D),
+    # "Data Quality", "Developer Support" all read as forming functions.
+    for title, dept in [
+        ("Head of Machine Learning", "AI"),
+        ("Head of Data Quality", "Data Platform"),
+        ("Head of Developer Support", "Engineering"),
+    ]:
+        board = _board(
+            [
+                _posting("p1", title, department=dept),
+                _posting("o1", "Backend Engineer", department="Other"),
+                _posting("o2", "Frontend Engineer", department="Other"),
+            ]
+        )
+        signals = signals_from_board(board, company_id="co-x", now=NOW)
+        greenfield = _by_type(signals).get("greenfield_team", [])
+        assert len(greenfield) == 1, f"{title!r} should fire greenfield"
+        assert greenfield[0].extracted_facts["department"] == dept
+
+
+def test_explicit_language_fires_even_for_support_function():
+    # The denylist gates ONLY the lone-leadership heuristic. An EXPLICIT
+    # founding/first-hire title in a support function still fires — explicit
+    # zero-to-one language is authoritative regardless of the function.
+    board = _board(
+        [
+            _posting("s1", "Founding Quality Engineer", department="Quality"),
+            _posting("e1", "Backend Engineer", department="Engineering"),
+            _posting("e2", "Frontend Engineer", department="Engineering"),
+        ]
+    )
+    signals = signals_from_board(board, company_id="co-x", now=NOW)
+    greenfield = _by_type(signals)["greenfield_team"]
+    assert len(greenfield) == 1
+    assert greenfield[0].extracted_facts["explicit_language"] is True
+
+
 def test_leadership_req_with_a_team_is_not_greenfield():
     # Head of Data PLUS data ICs -> the function already has a team, not greenfield.
     board = _board(
