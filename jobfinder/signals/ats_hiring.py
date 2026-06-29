@@ -63,6 +63,46 @@ _LEADERSHIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Support / operations / enablement functions. A lone "Head of <support function>"
+# on a board is routine org structure (every company has one), NOT a zero-to-one
+# team being stood up — so the lone-leadership greenfield heuristic must NOT fire
+# on it. This denylist gates ONLY that heuristic; the explicit-language branch
+# (_GREENFIELD_RE) is unaffected, and a genuine product/eng/GTM/data function
+# (e.g. "Head of Data") is permissive — it is absent here, so it still fires.
+# Live finding D: "Head of Learning & Quality, Stripe Delivery Center" wrongly
+# read as greenfield because "Head of" + a lone support function looked like a
+# forming seat.
+#
+# Matched against the TITLE only (the function being led), NOT the department:
+# a support word in the dept label would suppress a clean core title (dept
+# "Workplace" must not veto "Head of Engineering"), and the live cases all carry
+# the function in the title. Tokens are deliberately SPECIFIC, not bare words, to
+# avoid swallowing genuine technical/GTM seats: "learning" only in an L&D phrase
+# ("Learning & …"/"L&D"), never "Machine Learning"; "service/help/IT/technical
+# desk/support" forms rather than a bare "support" that would kill "Head of
+# Developer Support"; and no bare "quality" (it lives in "Data Quality"/"Quality
+# Engineering"). NOT routed through scoring.match_persona on purpose — greenfield
+# classification is a signal-layer concern, and that classifier maps to target
+# personas, not to "is this a routine back-office function".
+_SUPPORT_FUNCTION_RE = re.compile(
+    r"\b("
+    # "Learning & Development" (L&D) and its real-world variants — "learning"
+    # joined (either order) to an L&D COMPANION noun, plus the "L&D" initialism.
+    # Bound to the companion set on purpose: a bare "learning", or "learning"
+    # next to an arbitrary word, would swallow technical disciplines like
+    # "Machine Learning & Platform" / "Deep Learning & Research" (Bugbot finding).
+    r"learning\s*(?:&|and)\s*(?:development|quality|enablement|training|education)|"
+    r"(?:development|quality|enablement|training|education)\s*(?:&|and)\s*learning|"
+    r"l\s*&\s*d|"
+    r"training|enablement|"
+    r"helpdesk|help\s+desk|service\s+desk|it\s+support|technical\s+support|"
+    r"facilities|workplace|real\s+estate|office\s+management|"
+    r"it\s+operations|information\s+technology|"
+    r"compliance|payroll|procurement"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Explicit "new team / first hire" language in a posting title. The "first hire"
 # branch allows zero filler words ("First Hire"), an optional qualifier
 # ("first product hire"), and plural ("first hires").
@@ -244,9 +284,19 @@ def _greenfield_reason(posting: JobPosting, dept_counts: dict[str, int]) -> str 
     if _GREENFIELD_RE.search(posting.title):
         return "explicit new-team / first-hire language in the title"
     # A lone leadership req in a department with no other openings reads as a
-    # leader hired to stand up a function that has no team yet.
+    # leader hired to stand up a function that has no team yet — UNLESS the TITLE
+    # names a routine support/ops/enablement org (L&D, IT/service desk,
+    # facilities, compliance, …). Every company has those; a lone Head-of one is
+    # standard structure, not a zero-to-one build (live finding D). We test the
+    # title, not the department: a support word in a dept label must not veto a
+    # genuine core title (dept "Workplace" must not suppress "Head of Engineering").
     dept = posting.department or posting.team
-    if _LEADERSHIP_RE.search(posting.title) and dept and dept_counts.get(dept, 0) == 1:
+    if (
+        _LEADERSHIP_RE.search(posting.title)
+        and dept
+        and dept_counts.get(dept, 0) == 1
+        and not _SUPPORT_FUNCTION_RE.search(posting.title)
+    ):
         return f"lone leadership req in {dept} with no team beneath it"
     return None
 
