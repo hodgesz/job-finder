@@ -49,7 +49,10 @@ class Filing:
     cik: str
     accession_number: str  # dashed form, e.g. "0001140361-26-015711"
     form: str  # e.g. "8-K"
-    filing_date: date
+    # `_parse_date` returns None for a blank filingDate (some filers/forms omit
+    # it), so this is genuinely optional; callers that age-filter on it must
+    # handle None (see `recent_form_d(since=...)`).
+    filing_date: date | None
     report_date: date | None
     items: list[str] = field(default_factory=list)  # e.g. ["5.02", "9.01"]
     primary_document: str = ""
@@ -384,15 +387,30 @@ class EdgarClient:
         return result
 
     def recent_form_d(
-        self, cik: str | int, *, filings: list[Filing] | None = None
+        self,
+        cik: str | int,
+        *,
+        filings: list[Filing] | None = None,
+        since: date | None = None,
     ) -> list[Filing]:
         """Recent Form D filings (initial ``D`` and amendments ``D/A``).
 
         Pass an already-fetched `filings` list (e.g. from
         ``company_submissions``) to filter it without re-fetching.
+
+        `since` drops filings dated before that date, so a caller only fetches
+        and parses Form D documents recent enough to still carry a funding
+        signal (the signal module has a hard recency horizon; fetching older XML
+        just to discard it wastes a request against SEC's rate-limited host). A
+        filing with no parseable date is kept — we can't prove it's stale.
         """
         source = self.recent_filings(cik) if filings is None else filings
-        return [f for f in source if f.form in ("D", "D/A")]
+        result = [f for f in source if f.form in ("D", "D/A")]
+        if since is not None:
+            result = [
+                f for f in result if f.filing_date is None or f.filing_date >= since
+            ]
+        return result
 
     def fetch_document(self, filing: Filing) -> str:
         return self._fetch(filing.primary_document_url)

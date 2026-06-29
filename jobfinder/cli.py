@@ -34,6 +34,7 @@ from jobfinder.pipeline import CompanyInputs, PipelineResult, run_pipeline_detai
 from jobfinder.reporter import render_digest
 from jobfinder.schemas import Opportunity
 from jobfinder.signals.extraction import RegexExtractor
+from jobfinder.signals.form_d import FORM_D_RECENCY_HORIZON_DAYS
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD, RelatedPerson
 from jobfinder.sources.firmographics import firmographics_from_sec
@@ -242,7 +243,13 @@ def _demo_companies() -> list[CompanyInputs]:
 # --------------------------------------------------------------------------- #
 # Live mode: fetch real filings for given CIKs.
 # --------------------------------------------------------------------------- #
-def _live_companies(client: EdgarClient, ciks: list[str]) -> list[CompanyInputs]:
+def _live_companies(
+    client: EdgarClient, ciks: list[str], *, now: datetime
+) -> list[CompanyInputs]:
+    # One run clock drives both the Form D pre-filter cutoff and the signal-level
+    # recency floor, so a slow multi-CIK fetch can't age otherwise-identical
+    # filings against drifting instants. `now` is passed on to the pipeline too.
+    form_d_since = (now - timedelta(days=FORM_D_RECENCY_HORIZON_DAYS)).date()
     companies: list[CompanyInputs] = []
     for cik in ciks:
         # One fetch of the submissions index serves all three needs (filer info,
@@ -253,9 +260,12 @@ def _live_companies(client: EdgarClient, ciks: list[str]) -> list[CompanyInputs]
             (f, client.fetch_document(f))
             for f in client.recent_8k(cik, item="5.02", filings=filings)
         ]
+        # Only fetch Form D documents recent enough to still carry a funding
+        # signal: the signal module discards anything past its recency horizon,
+        # so fetching older XML just to drop it wastes SEC requests.
         form_d = [
             (f, client.fetch_form_d(f))
-            for f in client.recent_form_d(cik, filings=filings)
+            for f in client.recent_form_d(cik, filings=filings, since=form_d_since)
         ]
         # Derive firmographics from data we just fetched: the filer's SIC sector
         # (from the submissions header), falling back to a Form D industry group.
@@ -544,10 +554,14 @@ def main(argv: list[str] | None = None) -> int:
         if not args.cik and not args.ats:
             print("live: provide at least one --cik or --ats source.", file=sys.stderr)
             return 2
+        # One reference instant for the whole run: the Form D pre-filter cutoff
+        # and the recency floor/decay the pipeline applies share it, so they
+        # can't drift across a slow multi-CIK fetch.
+        now = datetime.now(timezone.utc)
         companies: list[CompanyInputs] = []
         if args.cik:
             edgar = EdgarClient.with_user_agent(args.user_agent)
-            companies.extend(_live_companies(edgar, args.cik))
+            companies.extend(_live_companies(edgar, args.cik, now=now))
         if args.ats:
             ats = AtsClient.with_user_agent(args.user_agent)
             companies.extend(_ats_companies(ats, args.ats))
@@ -555,7 +569,10 @@ def main(argv: list[str] | None = None) -> int:
         # company's derived firmographics into a real company_fit; without one,
         # fit stays the neutral literal.
         result = run_pipeline_detailed(
-            companies, candidate_profile=_profile_from_args(args)
+            companies,
+            candidate_profile=_profile_from_args(args),
+            observed_at=now,
+            now=now,
         )
     else:  # pragma: no cover - argparse enforces a valid command
         return 2
