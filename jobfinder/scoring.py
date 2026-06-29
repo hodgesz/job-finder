@@ -54,6 +54,32 @@ _VACUUM_TYPES = {"8k_exec_departure"}
 _HIRING_TYPES = {"ats_hiring_velocity", "department_surge"}
 _STRATEGIC_TYPES = {"greenfield_team", "tech_stack_change"}
 
+# The signal types that carry hiring *intent* — i.e. feed one of the four
+# intent-bearing components (liquidity / leadership_vacuum / hiring_velocity /
+# strategic_language). The other two components, ``recency`` and
+# ``company_fit``, are *modifiers*: they shape the score of an intent we already
+# have, but neither is intent on its own (every signal has a timestamp, and
+# every company has a fit). So an opportunity must be backed by at least one
+# intent signal to exist at all — otherwise we'd manufacture an "opportunity"
+# out of a company that merely filed *something* recently.
+#
+# This is the gate that keeps appointment-only 8-Ks off the board. An
+# ``8k_exec_appointment`` (someone JOINING) is the *opposite* of a leadership
+# vacuum — it deliberately feeds no component — so it carries no intent. Before
+# this gate, such a filing still surfaced as an opportunity at urgency 0%,
+# because ``recency`` alone cited the appointment signal's id and slipped it
+# past the "has a supporting signal" check. Live validation against real
+# early-growth 8-Ks (e.g. Reddit) flagged these no-intent appointment-only opps.
+# Other non-component types (``8k_distress_correlation``, ``new_exec_hire``)
+# are excluded for the same reason — none feeds a component yet.
+#
+# DERIVED from the four intent-component type sets, not hand-listed, so it can't
+# drift out of sync with them: a new intent-bearing component MUST fold its type
+# set into this union (otherwise its opportunities would score non-zero yet be
+# silently gated out here). `recency`/`company_fit` are intentionally absent —
+# they're modifiers, not intent.
+_INTENT_TYPES = _LIQUIDITY_TYPES | _VACUUM_TYPES | _HIRING_TYPES | _STRATEGIC_TYPES
+
 # A supporting signal older than this (days) contributes no recency. Senior
 # searches move on a months-not-years horizon; ~120 days is a generous window.
 RECENCY_HORIZON_DAYS = 120.0
@@ -266,6 +292,17 @@ def _signal_time(signal: Signal) -> datetime:
     return signal.effective_at or signal.observed_at
 
 
+def has_intent_signal(signals: list[Signal]) -> bool:
+    """Whether any signal carries hiring *intent* (feeds an intent component).
+
+    See ``_INTENT_TYPES``: ``recency`` and ``company_fit`` are modifiers, not
+    intent, so a company whose only signals are non-intent (e.g. an
+    appointment-only 8-K) carries nothing worth surfacing as an opportunity.
+    Public so the gate is unit-testable and reusable.
+    """
+    return any(s.signal_type in _INTENT_TYPES for s in signals)
+
+
 def _max_strength(signals: list[Signal], types: set[str]) -> tuple[float, list[str]]:
     """Strength of the strongest signal whose type is in `types`, with its id."""
     matches = [s for s in signals if s.signal_type in types]
@@ -442,7 +479,11 @@ def build_opportunity(
     """Turn a score breakdown into an evidence-backed `Opportunity`.
 
     Requires at least one supporting signal (the schema enforces this); callers
-    should filter out zero-signal companies before building.
+    should filter out zero-signal companies before building. Callers should also
+    gate on `has_intent_signal` first (as `rank_opportunities` does): without it
+    this will happily build an opportunity from a no-intent company (e.g. an
+    appointment-only 8-K) whose only supporting id comes from the recency
+    modifier — the urgency-0% "opportunity" the intent gate exists to suppress.
 
     When `target_persona` is None the persona is *derived* from the signals that
     actually scored the opportunity (`derive_persona`) rather than hardcoded — a
@@ -510,6 +551,13 @@ def rank_opportunities(
     opportunities: list[Opportunity] = []
     for company_id, signals in signals_by_company.items():
         if not signals:
+            continue
+        # An opportunity needs at least one *intent* signal: recency and
+        # company_fit are modifiers, not intent, so a company whose only signals
+        # are non-intent (an appointment-only 8-K, say) is not an opportunity —
+        # even though `recency` would otherwise cite its freshest signal and slip
+        # it past the supporting-id gate below at urgency 0%.
+        if not has_intent_signal(signals):
             continue
         breakdown = score_company(
             company_id,
