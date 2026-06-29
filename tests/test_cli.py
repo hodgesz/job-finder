@@ -367,7 +367,7 @@ def _edgar_fetcher(url: str) -> str:
 
 
 def test_live_company_derives_firmographics_and_real_name():
-    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"])
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"], now=NOW)
     assert len(companies) == 1
     company = companies[0]
     # The real entity name from the index replaces the "CIK <n>" stub.
@@ -380,11 +380,45 @@ def test_live_company_derives_firmographics_and_real_name():
     assert company.firmographics.employee_count is None
 
 
+def test_live_company_skips_fetching_stale_form_d():
+    # End-to-end recency floor: the fixture has two Apr-2026 Form Ds and one from
+    # Sep 2025. With `now` well past a year after the stale one, _live_companies
+    # must filter it out *before* fetching, so its XML is never requested — the
+    # collector cutoff and the signal floor share the one run clock.
+    fetched: list[str] = []
+
+    def fetcher(url: str) -> str:
+        fetched.append(url)
+        if "/submissions/" in url:
+            return (FIXTURES / "submissions_form_d.json").read_text()
+        return (FIXTURES / "form_d_sample.xml").read_text()
+
+    # ~10 months after the latest filing: the Apr-2026 pair is still inside the
+    # 365-day horizon, the Sep-2025 filing is well past it.
+    now = datetime(2027, 2, 1, tzinfo=timezone.utc)
+    companies = _live_companies(EdgarClient(fetcher), ["1950000"], now=now)
+
+    # The stale filing's XML was never fetched (only the index + the two fresh
+    # Form D documents).
+    doc_fetches = [u for u in fetched if "/submissions/" not in u]
+    assert len(doc_fetches) == 2
+    # And only the two fresh Form Ds produced funding signals.
+    assert len(companies) == 1
+    form_d_signals = [
+        s
+        for s in run_pipeline_detailed(
+            companies, observed_at=now, now=now, extractor=RegexExtractor()
+        ).signals
+        if s.signal_type in ("form_d_funding", "form_d_amendment")
+    ]
+    assert len(form_d_signals) == 2
+
+
 def test_live_company_fit_uses_derived_sector():
     # End to end: a profile whose target sector matches the derived SIC sector
     # lifts company_fit above the neutral 0.5; a non-matching sector pulls it
     # below — proving live runs no longer get the flat placeholder.
-    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"])
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"], now=NOW)
 
     match = run_pipeline(
         companies,

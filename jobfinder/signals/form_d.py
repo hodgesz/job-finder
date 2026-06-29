@@ -30,10 +30,47 @@ from jobfinder.sources.edgar import Filing, FormD
 MIN_MEANINGFUL_RAISE = 1_000_000.0
 STRONG_RAISE = 25_000_000.0
 
+# A Form D reports *when* capital was raised; that recency is the whole point of
+# the funding signal. A raise that closed years ago has already funded whatever
+# build-out it was going to fund — it is not evidence of a hiring window *today*.
+# So beyond this horizon we emit no funding signal at all (the recency floor),
+# and within it the signal's strength decays linearly with age. ~1 year covers a
+# typical post-raise hiring ramp. This is the single source of truth for "how old
+# is too old"; the live collector reads it to avoid fetching ancient Form D XML
+# it would only discard (see `EdgarClient.recent_form_d(since=...)`).
+#
+# The scorer's own `recency` component (weight 0.05, `scoring.RECENCY_HORIZON_DAYS`
+# = 120) is far too small to dampen a stale-but-large raise on its own — a 2020
+# Form D scoring "capital raised 100%" still topped the ranking — which is why the
+# floor and decay belong here, at the signal level, not in the composite score.
+# This horizon is deliberately distinct from (and longer than) the scorer's: it
+# governs whether a funding signal *exists at all*, whereas the scorer's recency
+# fine-tunes an already-emitted signal's freshness. The within-horizon decay and
+# the scorer's recency only overlap in the ~90-120 day band, where mild
+# double-dampening of a months-old raise is acceptable and intended.
+FORM_D_RECENCY_HORIZON_DAYS = 365.0
+# Within this many days of filing the raise is treated as fully fresh (the
+# capital just landed); past it the age factor ramps down linearly to 0 at the
+# horizon.
+FORM_D_FRESH_DAYS = 90.0
+
 
 def _utcnow() -> datetime:
     # Wrapped so callers/tests can monkeypatch if they need determinism.
     return datetime.now(timezone.utc)
+
+
+def _age_factor(age_days: float) -> float:
+    """Freshness multiplier in [0, 1] for a raise ``age_days`` old.
+
+    Full weight while the capital is fresh (<= ``FORM_D_FRESH_DAYS``), then a
+    linear decay to 0 at ``FORM_D_RECENCY_HORIZON_DAYS``. A negative age (a
+    future-dated filing / clock skew) clamps to fully fresh.
+    """
+    if age_days <= FORM_D_FRESH_DAYS:
+        return 1.0
+    span = FORM_D_RECENCY_HORIZON_DAYS - FORM_D_FRESH_DAYS
+    return max(0.0, 1.0 - (age_days - FORM_D_FRESH_DAYS) / span)
 
 
 def _fraction_sold(form_d: FormD) -> float | None:
@@ -90,7 +127,9 @@ def signal_from_form_d(
     """Produce a funding Signal from one Form D filing + its parsed data.
 
     Returns ``None`` when the filing reports no amount sold (a bare notice of
-    intent with nothing raised yet carries no budget signal).
+    intent with nothing raised yet carries no budget signal), or when the raise
+    is older than ``FORM_D_RECENCY_HORIZON_DAYS`` — a years-old round is not a
+    hiring signal today (the recency floor).
     """
     if not form_d.total_amount_sold:
         return None
@@ -101,6 +140,18 @@ def signal_from_form_d(
         if filing.filing_date
         else None
     )
+
+    # Recency floor + decay: capital raised long ago no longer signals a hiring
+    # window. With no filing date we can't age it, so we treat it as current
+    # (fresh) rather than silently dropping it. Age is measured from the event
+    # (filing date) to when we observed it.
+    age_factor = 1.0
+    if effective is not None:
+        age_days = (observed - effective).total_seconds() / 86_400.0
+        if age_days >= FORM_D_RECENCY_HORIZON_DAYS:
+            return None
+        age_factor = _age_factor(age_days)
+
     signal_type = "form_d_amendment" if form_d.is_amendment else "form_d_funding"
 
     fraction = _fraction_sold(form_d)
@@ -161,7 +212,11 @@ def signal_from_form_d(
         evidence=evidence,
         # Structured XML — high confidence the numbers are what they say.
         confidence=0.95,
-        strength=_strength(form_d),
+        # Strength blends the raise's size/completeness with its freshness: a
+        # large raise that closed 10 months ago is a weaker hiring signal than
+        # the same raise last month (and one past the horizon emitted no signal
+        # at all, above).
+        strength=round(_strength(form_d) * age_factor, 3),
     )
 
 
