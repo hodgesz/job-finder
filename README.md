@@ -1,4 +1,4 @@
-# job-finder
+# Executive Opportunity Intelligence System
 
 A multi-agent Python system for surfacing **hidden-market job opportunities** by
 tracking the leading signals that precede a hire — often weeks or months before a
