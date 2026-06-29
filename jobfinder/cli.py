@@ -12,12 +12,19 @@ Two modes:
     job-finder demo                          run the built-in offline dataset
     job-finder live --cik 320193             fetch real SEC filings for CIK(s)
     job-finder live --ats greenhouse:stripe  read a public ATS job board
-    job-finder live --cik 320193 --ats lever:netflix   both, per company
+    job-finder live --company cik=320193,ats=greenhouse:stripe   join both on one
+                                             company so a SEC signal is
+                                             corroborated by that company's reqs
+
+`--cik`/`--ats` each build a single-source company; `--company` *joins* a CIK and
+one or more ATS boards onto ONE company record, which is what lets an 8-K
+leadership vacuum be corroborated by that same company's live listed roles (the
+flagship use case that previously fired only in the offline demo).
 
 The demo mode embeds its filings and job boards inline so it runs anywhere with
 zero network and zero API key — the regex fallback handles 8-K classification.
-`live` mode requires at least one source (--cik and/or --ats) and a contact
-User-Agent (see --user-agent); SEC mandates a contact email when fetching
+`live` mode requires at least one source (--cik, --ats and/or --company) and a
+contact User-Agent (see --user-agent); SEC mandates a contact email when fetching
 filings.
 
 Built on argparse (stdlib) — no new dependency.
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 from jobfinder.fit import CandidateProfile, Firmographics
@@ -243,47 +251,105 @@ def _demo_companies() -> list[CompanyInputs]:
 
 
 # --------------------------------------------------------------------------- #
-# Live mode: fetch real filings for given CIKs.
+# Live mode: fetch real filings and/or public ATS boards, joined per company.
 # --------------------------------------------------------------------------- #
-def _live_companies(
-    client: EdgarClient, ciks: list[str], *, now: datetime
-) -> list[CompanyInputs]:
-    # One run clock drives both the Form D pre-filter cutoff and the signal-level
-    # recency floor, so a slow multi-CIK fetch can't age otherwise-identical
-    # filings against drifting instants. `now` is passed on to the pipeline too.
-    form_d_since = (now - timedelta(days=FORM_D_RECENCY_HORIZON_DAYS)).date()
-    companies: list[CompanyInputs] = []
-    for cik in ciks:
+@dataclass
+class CompanySpec:
+    """One real-world company to assess, naming whichever sources cover it.
+
+    A company may have a SEC presence (``cik``), one or more public ATS boards
+    (``ats`` as ``(provider, token)`` pairs), or both. Carrying both on one spec
+    is what lets the live path land a CIK's 8-K/Form D signals *and* that same
+    company's listed roles on a single ``CompanyInputs`` — so an 8-K leadership
+    vacuum can be corroborated by the company's own live reqs (the flagship
+    Slice-11 use case, which previously fired only in the offline demo).
+    """
+
+    cik: str | None = None
+    ats: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def company_id(self) -> str:
+        # The CIK identifies the legal entity, so prefer it; otherwise the first
+        # board names the company. `is not None` (not truthiness) matches the
+        # source-selection test in `_build_company`, so the id and the fetch
+        # branch can never disagree. (`_live_specs` guarantees a non-empty cik
+        # and at least one source.)
+        if self.cik is not None:
+            return f"cik-{self.cik}"
+        provider, token = self.ats[0]
+        return f"ats-{provider}-{token}"
+
+
+def _build_company(
+    spec: CompanySpec,
+    *,
+    edgar: EdgarClient | None,
+    ats_client: AtsClient | None,
+    now: datetime,
+) -> CompanyInputs:
+    """Assemble one ``CompanyInputs`` from every source a spec names.
+
+    The single live-mode assembler: SEC filings (8-K + recency-filtered Form D),
+    derived firmographics, and ATS boards all land on ONE record, joined by the
+    company they describe. ``edgar``/``ats_client`` are only consulted for the
+    source kinds the spec actually uses, so a CIK-only spec never builds an ATS
+    client and vice versa.
+    """
+    eight_k: list[tuple[Filing, str]] = []
+    form_d: list[tuple[Filing, FormD]] = []
+    firmographics = None
+    name = ""
+
+    if spec.cik is not None:
+        if edgar is None:  # caller must build the client whenever any cik is set
+            raise ValueError(f"spec {spec.company_id} needs a CIK but no EdgarClient")
+        # One run clock drives both the Form D pre-filter cutoff and the
+        # signal-level recency floor, so a slow multi-company fetch can't age
+        # otherwise-identical filings against drifting instants.
+        form_d_since = (now - timedelta(days=FORM_D_RECENCY_HORIZON_DAYS)).date()
         # One fetch of the submissions index serves all three needs (filer info,
         # 8-K and Form D filing lists), so a live CIK makes a single request to
         # SEC's rate-limited endpoint rather than three identical ones.
-        info, filings = client.company_submissions(cik)
+        info, filings = edgar.company_submissions(spec.cik)
         eight_k = [
-            (f, client.fetch_document(f))
-            for f in client.recent_8k(cik, item="5.02", filings=filings)
+            (f, edgar.fetch_document(f))
+            for f in edgar.recent_8k(spec.cik, item="5.02", filings=filings)
         ]
         # Only fetch Form D documents recent enough to still carry a funding
         # signal: the signal module discards anything past its recency horizon,
         # so fetching older XML just to drop it wastes SEC requests.
         form_d = [
-            (f, client.fetch_form_d(f))
-            for f in client.recent_form_d(cik, filings=filings, since=form_d_since)
+            (f, edgar.fetch_form_d(f))
+            for f in edgar.recent_form_d(spec.cik, filings=filings, since=form_d_since)
         ]
         # Derive firmographics from data we just fetched: the filer's SIC sector
         # (from the submissions header), falling back to a Form D industry group.
         # Funding stage/headcount aren't in SEC filings, so they stay neutral.
         firmographics = firmographics_from_sec(info, form_d=[fd for _, fd in form_d])
-        companies.append(
-            CompanyInputs(
-                company_id=f"cik-{cik}",
-                # Prefer the real entity name from the index over a "CIK <n>" stub.
-                name=info.name or f"CIK {cik}",
-                eight_k=eight_k,
-                form_d=form_d,
-                firmographics=firmographics,
-            )
-        )
-    return companies
+        # Prefer the real entity name from the index over a "CIK <n>" stub.
+        name = info.name or f"CIK {spec.cik}"
+
+    ats_boards: list[JobBoard] = []
+    if spec.ats and ats_client is None:  # caller must build it whenever any ats set
+        raise ValueError(f"spec {spec.company_id} needs ATS boards but no AtsClient")
+    for provider, token in spec.ats:
+        ats_boards.append(ats_client.fetch_board(provider, token))
+
+    # A board-only company takes its name from its first board, matching the
+    # standalone --ats behaviour ("token (provider)").
+    if not name and spec.ats:
+        provider, token = spec.ats[0]
+        name = f"{token} ({provider})"
+
+    return CompanyInputs(
+        company_id=spec.company_id,
+        name=name,
+        eight_k=eight_k,
+        form_d=form_d,
+        ats_boards=ats_boards,
+        firmographics=firmographics,
+    )
 
 
 def _profile_from_args(args: argparse.Namespace) -> CandidateProfile | None:
@@ -321,20 +387,99 @@ def _parse_ats_spec(spec: str) -> tuple[str, str]:
     return provider, token
 
 
-def _ats_companies(client: AtsClient, specs: list[str]) -> list[CompanyInputs]:
-    """Build one company per ``provider:token`` board spec."""
-    companies: list[CompanyInputs] = []
-    for spec in specs:
-        provider, token = _parse_ats_spec(spec)
-        board = client.fetch_board(provider, token)
-        companies.append(
-            CompanyInputs(
-                company_id=f"ats-{provider}-{token}",
-                name=f"{token} ({provider})",
-                ats_boards=[board],
+def _parse_company_spec(spec: str) -> CompanySpec:
+    """Parse a ``--company`` argument joining a CIK and/or ATS boards.
+
+    Syntax is comma-separated ``key=value`` parts, each either ``cik=<n>`` (at
+    most one) or ``ats=provider:token`` (repeatable), e.g.::
+
+        --company cik=320193,ats=greenhouse:stripe
+        --company cik=1950000,ats=greenhouse:northwind,ats=lever:northwind
+
+    Every source named lands on ONE company record, so a CIK's SEC signals and
+    that same company's listed roles are joined — which is what lets live-mode
+    corroboration fire on a SEC-sourced opportunity. At least one source is
+    required; a duplicate ``cik=`` is rejected (a company has one legal entity).
+    """
+    cik: str | None = None
+    ats: list[tuple[str, str]] = []
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if not sep or not value:
+            raise ValueError(
+                f"--company part {part!r} must be 'key=value'; expected "
+                f"'cik=<n>' or 'ats=provider:token'."
             )
+        if key == "cik":
+            if cik is not None:
+                raise ValueError(
+                    f"--company {spec!r} names more than one cik= "
+                    "(a company has a single SEC entity)."
+                )
+            cik = value
+        elif key == "ats":
+            ats.append(_parse_ats_spec(value))
+        else:
+            raise ValueError(
+                f"--company part {part!r} has unknown key {key!r}; "
+                "expected 'cik' or 'ats'."
+            )
+    if cik is None and not ats:
+        raise ValueError(
+            f"--company {spec!r} names no sources; give a 'cik=' and/or 'ats='."
         )
-    return companies
+    return CompanySpec(cik=cik, ats=ats)
+
+
+def _clean_cik(cik: str) -> str:
+    """Validate a standalone --cik value into a non-empty token.
+
+    ``--company cik=`` is already rejected for an empty value by
+    ``_parse_company_spec``; standalone ``--cik`` reaches here unparsed, so an
+    empty/whitespace value must be caught the same way — otherwise it would build
+    a ``CompanySpec(cik="")`` that selects the SEC branch (``cik is not None``)
+    yet fetches an empty CIK.
+    """
+    value = cik.strip()
+    if not value:
+        raise ValueError("--cik must be a non-empty SEC CIK.")
+    return value
+
+
+def _live_specs(args: argparse.Namespace) -> list[CompanySpec]:
+    """Turn the live source flags into the company specs to assess.
+
+    ``--company`` joins sources on one record; standalone ``--cik``/``--ats``
+    each build a single-source company (unchanged behaviour). Joined companies
+    are listed first, then the standalone ones, in the order given.
+
+    Two specs that resolve to the same ``company_id`` are rejected: the pipeline
+    buckets signals by company_id and ``render`` keys boards by it, so a
+    collision (e.g. ``--company cik=N,ats=…`` alongside a standalone ``--cik N``)
+    would silently merge signals and DROP one record's boards — losing exactly
+    the corroboration the join exists to provide. The fix is to combine the
+    sources into one ``--company`` spec, which the error message says.
+    """
+    specs = [_parse_company_spec(c) for c in args.company]
+    specs.extend(CompanySpec(cik=_clean_cik(cik)) for cik in args.cik)
+    specs.extend(CompanySpec(ats=[_parse_ats_spec(a)]) for a in args.ats)
+
+    seen: set[str] = set()
+    for spec in specs:
+        cid = spec.company_id
+        if cid in seen:
+            raise ValueError(
+                f"company {cid!r} is named by more than one source flag; "
+                "combine them into a single --company spec "
+                "(e.g. --company cik=N,ats=provider:token)."
+            )
+        seen.add(cid)
+    return specs
 
 
 # --------------------------------------------------------------------------- #
@@ -497,7 +642,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PROVIDER:TOKEN",
         help=(
             "Public ATS board as 'provider:token' (repeatable), e.g. "
-            "'greenhouse:stripe', 'lever:netflix', 'ashby:openai'."
+            "'greenhouse:stripe', 'lever:netflix', 'ashby:openai'. Builds a "
+            "standalone board-only company; use --company to join a board to a CIK."
+        ),
+    )
+    live.add_argument(
+        "--company",
+        action="append",
+        default=[],
+        metavar="cik=N,ats=PROVIDER:TOKEN",
+        help=(
+            "Join a CIK and/or one or more ATS boards on ONE company, e.g. "
+            "'cik=320193,ats=greenhouse:stripe' (repeatable). This is what lets "
+            "an 8-K leadership vacuum be corroborated by that same company's live "
+            "reqs; --cik/--ats alone build single-source companies."
         ),
     )
     live.add_argument(
@@ -602,22 +760,39 @@ def main(argv: list[str] | None = None) -> int:
             extractor=RegexExtractor(),
         )
     elif args.command == "live":
-        if not args.cik and not args.ats:
-            print("live: provide at least one --cik or --ats source.", file=sys.stderr)
+        if not args.cik and not args.ats and not args.company:
+            print(
+                "live: provide at least one --cik, --ats or --company source.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            specs = _live_specs(args)
+        except ValueError as exc:
+            print(f"live: {exc}", file=sys.stderr)
             return 2
         # One reference instant for the whole run: the Form D pre-filter cutoff,
         # the recency floor/decay the pipeline applies, AND the listed-roles
-        # "opened recently" check all share it, so they can't drift across a slow
-        # multi-CIK fetch.
+        # "active recently" check all share it, so they can't drift across a slow
+        # multi-company fetch.
         now = datetime.now(timezone.utc)
         run_now = now
-        companies: list[CompanyInputs] = []
-        if args.cik:
-            edgar = EdgarClient.with_user_agent(args.user_agent)
-            companies.extend(_live_companies(edgar, args.cik, now=now))
-        if args.ats:
-            ats = AtsClient.with_user_agent(args.user_agent)
-            companies.extend(_ats_companies(ats, args.ats))
+        # Build each client lazily — only when some spec actually needs it, so a
+        # board-only run never constructs an EDGAR client and vice versa.
+        edgar = (
+            EdgarClient.with_user_agent(args.user_agent)
+            if any(s.cik is not None for s in specs)
+            else None
+        )
+        ats_client = (
+            AtsClient.with_user_agent(args.user_agent)
+            if any(s.ats for s in specs)
+            else None
+        )
+        companies = [
+            _build_company(spec, edgar=edgar, ats_client=ats_client, now=now)
+            for spec in specs
+        ]
         # A candidate profile (if any --target-* flags were given) turns each
         # company's derived firmographics into a real company_fit; without one,
         # fit stays the neutral literal.
