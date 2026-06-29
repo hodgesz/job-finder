@@ -365,22 +365,24 @@ def render(
     companies: list[CompanyInputs],
     *,
     top: int,
-    signals: list[Signal] | None = None,
+    signals: list[Signal],
     now: datetime | None = None,
 ) -> str:
     """Render ranked opportunities as a human-readable report.
 
     When a company has public ATS boards on hand, each opportunity also lists the
     live reqs that corroborate it (in-function roles first) — the hidden seat plus
-    the listed roles around it. `signals` are the run's signals; they let each
-    opportunity's *authoritative* target function be recovered (a persona is only
-    treated as a function to match against when a signal actually derived it, not
-    when it's the scorer's default fallback). `now` is the recency reference; it
-    defaults to utcnow so existing callers are unaffected.
+    the listed roles around it. `signals` are the run's signals (required): they
+    let each opportunity's *authoritative* target function be recovered (a persona
+    is only treated as a function to match against when a signal actually derived
+    it, not when it's the scorer's default fallback), so a posting that drove the
+    opportunity is flagged in-function. It is required — not optional — so a
+    caller can't silently disable in-function matching by omitting it. `now` is
+    the recency reference; it defaults to utcnow.
     """
     names = {c.company_id: (c.name or c.company_id) for c in companies}
     boards_by_company = {c.company_id: c.ats_boards for c in companies}
-    signals_by_id = {s.id: s for s in (signals or [])}
+    signals_by_id = {s.id: s for s in signals}
     reference = now or datetime.now(timezone.utc)
     lines: list[str] = []
     # The target persona is now derived per-opportunity from its signals (an

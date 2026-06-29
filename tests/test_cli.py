@@ -111,7 +111,8 @@ def test_demo_personas_differ_by_signal():
 
 
 def test_demo_render_shows_distinct_personas():
-    out = render(_run(_demo_companies()), _demo_companies(), top=5)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=5, signals=result.signals)
     assert "Target: VP Engineering / Engineering leader" in out
     assert "Target: CFO / VP Finance" in out
     # Header no longer claims a single fixed persona.
@@ -119,8 +120,8 @@ def test_demo_render_shows_distinct_personas():
 
 
 def test_render_includes_evidence_and_why_now():
-    opps = _run(_demo_companies())
-    out = render(opps, _demo_companies(), top=5)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=5, signals=result.signals)
     assert "Northwind Robotics Inc." in out
     assert "Why now:" in out
     assert "Evidence (supporting signals):" in out
@@ -223,14 +224,14 @@ def test_render_funding_only_opp_does_not_fake_in_function_roles():
 
 
 def test_render_respects_top_n():
-    opps = _run(_demo_companies())
-    out = render(opps, _demo_companies(), top=1)
+    result = _detailed(_demo_companies())
+    out = render(result.opportunities, _demo_companies(), top=1, signals=result.signals)
     assert "1. Northwind" in out
     assert "Lumen Bio Corp." not in out
 
 
 def test_render_handles_no_opportunities():
-    out = render([], [], top=5)
+    out = render([], [], top=5, signals=[])
     assert "No qualifying opportunities found." in out
 
 
