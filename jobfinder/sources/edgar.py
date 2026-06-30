@@ -114,6 +114,13 @@ class CompanyInfo:
     the heaviest dimension of the candidate-fit model — derivable from data we
     already fetch, with no extra network call or API key.
 
+    The header also lists the stock ``exchanges`` the filer is listed on (e.g.
+    ``["Nasdaq"]``). A non-empty list is an honest, free signal that the company
+    is exchange-listed — i.e. its funding *stage* is effectively "public", the
+    last step of the fit model's stage progression. (An SEC registrant that has
+    no exchange listing — many Form D private issuers — leaves this empty, so we
+    never assume a stage we can't substantiate.)
+
     ``sic_description`` is ``None`` when the index omits it (some filers have no
     assigned SIC); callers treat an absent sector as neutral, never punitive.
     """
@@ -122,6 +129,7 @@ class CompanyInfo:
     name: str = ""
     sic: str | None = None
     sic_description: str | None = None
+    exchanges: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,11 +242,24 @@ def parse_company_info(payload: str | dict) -> CompanyInfo:
     optional in the index, so missing or blank values become ``None``.
     """
     data = json.loads(payload) if isinstance(payload, str) else payload
+    # ``exchanges`` is a JSON array of exchange names (e.g. ["Nasdaq"]); some
+    # filers omit it or carry blank entries, so keep only non-empty trimmed
+    # strings. A non-empty result means the filer is exchange-listed. The
+    # payload is external SEC JSON, so guard the shape: a missing/scalar value
+    # yields no exchanges (don't iterate a bare string char-by-char), and a
+    # non-string element is skipped (don't crash on ``.strip()``).
+    raw_exchanges = data.get("exchanges")
+    if not isinstance(raw_exchanges, list):
+        raw_exchanges = []
+    exchanges = tuple(
+        x.strip() for x in raw_exchanges if isinstance(x, str) and x.strip()
+    )
     return CompanyInfo(
         cik=_normalize_cik(data.get("cik", "0")),
         name=(data.get("name") or "").strip(),
         sic=(str(data.get("sic") or "")).strip() or None,
         sic_description=(data.get("sicDescription") or "").strip() or None,
+        exchanges=exchanges,
     )
 
 

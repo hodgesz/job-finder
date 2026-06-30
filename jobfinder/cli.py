@@ -47,6 +47,7 @@ from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.signals.form_d import FORM_D_RECENCY_HORIZON_DAYS
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD, RelatedPerson
+from jobfinder.sources.enrichment import EnrichmentClient, NullEnrichmentClient
 from jobfinder.sources.firmographics import firmographics_from_sec
 from jobfinder.store import PersistResult, Store
 
@@ -286,6 +287,7 @@ def _build_company(
     *,
     edgar: EdgarClient | None,
     ats_client: AtsClient | None,
+    enrichment_client: EnrichmentClient,
     now: datetime,
 ) -> CompanyInputs:
     """Assemble one ``CompanyInputs`` from every source a spec names.
@@ -294,7 +296,10 @@ def _build_company(
     derived firmographics, and ATS boards all land on ONE record, joined by the
     company they describe. ``edgar``/``ats_client`` are only consulted for the
     source kinds the spec actually uses, so a CIK-only spec never builds an ATS
-    client and vice versa.
+    client and vice versa. ``enrichment_client`` fills the firmographic
+    dimensions SEC can't disclose (a private company's funding stage, every
+    company's headcount); the default ``NullEnrichmentClient`` fills nothing, so
+    a run with no vendor bound keeps the pre-Slice-17 sector-only behaviour.
     """
     eight_k: list[tuple[Filing, str]] = []
     form_d: list[tuple[Filing, FormD]] = []
@@ -324,9 +329,15 @@ def _build_company(
             for f in edgar.recent_form_d(spec.cik, filings=filings, since=form_d_since)
         ]
         # Derive firmographics from data we just fetched: the filer's SIC sector
-        # (from the submissions header), falling back to a Form D industry group.
-        # Funding stage/headcount aren't in SEC filings, so they stay neutral.
-        firmographics = firmographics_from_sec(info, form_d=[fd for _, fd in form_d])
+        # (from the submissions header) plus a free "public" funding stage when
+        # the filer is exchange-listed, falling back to a Form D industry group
+        # for the sector. The enrichment client fills the SEC-blind dimensions (a
+        # private company's stage, headcount); by default it fills nothing.
+        firmographics = firmographics_from_sec(
+            info,
+            form_d=[fd for _, fd in form_d],
+            enrichment=enrichment_client.enrich(cik=spec.cik, name=info.name),
+        )
         # Prefer the real entity name from the index over a "CIK <n>" stub.
         name = info.name or f"CIK {spec.cik}"
 
@@ -666,11 +677,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Candidate profile: drives the derived company_fit. Sectors are scored
     # against the firmographics derived from the SEC filings (the SIC sector).
-    # Stage/size are accepted but cannot influence the live SCORE yet: SEC
-    # filings disclose neither, so those firmographic fields are None and score
-    # neutral (the fit model never penalises a dimension it can't see). They will
-    # engage once a richer enrichment source populates those fields. Omit all of
-    # these and fit falls back to the neutral literal (the pre-Slice-9 behaviour).
+    # Stage engages live for exchange-listed filers (derived as "public" from the
+    # submissions header); a private company's stage and every company's headcount
+    # score neutral until an enrichment vendor is bound — the fit model never
+    # penalises a dimension it can't see. Omit all of these and fit falls back to
+    # the neutral literal (the pre-Slice-9 behaviour).
     live.add_argument(
         "--target-sector",
         action="append",
@@ -685,22 +696,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="STAGE",
         help="A funding stage the candidate targets (repeatable), e.g. "
-        "'series_b'. SEC filings carry no funding stage, so this scores neutral "
-        "until stage enrichment lands.",
+        "'series_b' or 'public'. Exchange-listed filers score as 'public' (free, "
+        "from the submissions header); a private company's stage scores neutral "
+        "until stage enrichment is bound.",
     )
     live.add_argument(
         "--min-employees",
         type=int,
         default=None,
         help="Lower bound of the target headcount band. SEC filings carry no "
-        "headcount, so this scores neutral until headcount enrichment lands.",
+        "headcount, so this scores neutral until headcount enrichment is bound.",
     )
     live.add_argument(
         "--max-employees",
         type=int,
         default=None,
         help="Upper bound of the target headcount band. SEC filings carry no "
-        "headcount, so this scores neutral until headcount enrichment lands.",
+        "headcount, so this scores neutral until headcount enrichment is bound.",
     )
 
     report = sub.add_parser(
@@ -789,8 +801,20 @@ def main(argv: list[str] | None = None) -> int:
             if any(s.ats for s in specs)
             else None
         )
+        # No firmographic enrichment vendor is bound this slice: the default
+        # client fills nothing, so funding stage (beyond the free "public" we
+        # derive for exchange-listed filers) and headcount stay neutral. A future
+        # slice can swap in an env-keyed vendor client here without touching the
+        # assembler or the fit model.
+        enrichment_client = NullEnrichmentClient()
         companies = [
-            _build_company(spec, edgar=edgar, ats_client=ats_client, now=now)
+            _build_company(
+                spec,
+                edgar=edgar,
+                ats_client=ats_client,
+                enrichment_client=enrichment_client,
+                now=now,
+            )
             for spec in specs
         ]
         # A candidate profile (if any --target-* flags were given) turns each

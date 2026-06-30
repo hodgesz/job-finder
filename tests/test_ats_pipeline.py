@@ -14,6 +14,7 @@ from jobfinder.cli import (
 from jobfinder.pipeline import CompanyInputs, run_pipeline_detailed
 from jobfinder.scoring import score_company
 from jobfinder.sources.ats import AtsClient, JobBoard, JobPosting
+from jobfinder.sources.enrichment import NullEnrichmentClient
 
 NOW = datetime(2026, 6, 28, tzinfo=timezone.utc)
 
@@ -67,6 +68,7 @@ def test_build_company_board_only_from_injected_client():
         CompanySpec(ats=[("greenhouse", "acme")]),
         edgar=None,
         ats_client=client,
+        enrichment_client=NullEnrichmentClient(),
         now=NOW,
     )
     assert company.company_id == "ats-greenhouse-acme"
