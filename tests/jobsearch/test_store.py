@@ -234,6 +234,39 @@ def test_job_key_fully_blank_posting_is_stable(store: JobStore):
     assert k1 == k2 and k1.startswith("raw:")
 
 
+def test_raw_hash_fallback_distinguishes_by_full_content(store: JobStore):
+    # The raw: hash must cover the FULL stable content, not just company/title/
+    # location: two under-parsed jobs (no company/title/hard-key) that differ ONLY
+    # in another field (here department + snippet) must get DISTINCT keys, or CRM
+    # upserts would silently overwrite one with the other. (Bugbot Medium, PR #29.)
+    def under_parsed(*, department: str, snippet: str) -> CanonicalJob:
+        # No company, no title signature, no url/source_job_id → no hard key.
+        raw = RawPosting(
+            title="",
+            company="",
+            source=Source.LINKEDIN_ALERT,
+            department=department,
+            snippet=snippet,
+        )
+        return CanonicalJob(
+            company="",
+            title="",
+            normalized_title="",
+            department=department,
+            sources=[raw],
+        )
+
+    a = under_parsed(department="Data & AI", snippet="Lead the AI org.")
+    b = under_parsed(department="Marketing", snippet="Run growth.")
+    assert job_key(a) != job_key(b)  # not collapsed by the raw: hash
+    store.save_match(_match(a), now=NOW)
+    store.save_match(_match(b), now=NOW)
+    assert len(store.list_jobs()) == 2  # no silent overwrite
+    # ...and the SAME under-parsed job re-ingests stably (updates in place).
+    assert store.save_match(_match(a), now=LATER) is False
+    assert len(store.list_jobs()) == 2
+
+
 def test_job_key_identity_matches_in_run_dedupe(store: JobStore):
     # Two postings of the same role that the soft key would dedupe must resolve to
     # the same stored row (persistence identity == dedupe identity), even with a

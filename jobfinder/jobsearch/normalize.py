@@ -185,9 +185,32 @@ def job_key(job: CanonicalJob) -> str:
         hard = _hard_keys(raw)
         if hard:
             return f"hard:{hard[0]}"
-    # No company, no title signature, no hard key: hash the raw fields so the row
-    # is at least stable across runs and distinct from other under-parsed jobs.
-    seed = f"{job.company}\x1f{job.title}\x1f{job.location or ''}"
+    # No company, no title signature, no hard key: hash the FULL stable content of
+    # the job and every source posting, so two under-parsed jobs that canonicalize
+    # kept separate (sharing only the blank company/title/location but differing in
+    # any other field — department, workplace_type, snippet, source) still get
+    # distinct keys, while re-ingesting the SAME posting reproduces its key.
+    # Hashing only company/title/location would collapse such distinct jobs.
+    parts: list[str] = [
+        job.company,
+        job.title,
+        job.location or "",
+        job.workplace_type or "",
+        job.department or "",
+        job.best_apply_url or "",
+    ]
+    for raw in job.sources:
+        parts += [
+            raw.source.value,
+            raw.title,
+            raw.company,
+            raw.url or "",
+            raw.source_job_id or "",
+            raw.location or "",
+            raw.department or "",
+            raw.snippet or "",
+        ]
+    seed = "\x1f".join(parts)
     digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).hexdigest()
     return f"raw:{digest}"
 
