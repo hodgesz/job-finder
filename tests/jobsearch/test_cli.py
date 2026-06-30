@@ -125,6 +125,61 @@ def test_gmail_source_built_lazily_and_merged(capsys, monkeypatch):
     assert "VP of AI" in capsys.readouterr().out
 
 
+def test_rerank_without_key_falls_back_to_layer1(capsys, monkeypatch):
+    # --rerank with no GEMINI_API_KEY warns and ranks with pure Layer-1 (rc 0).
+    import jobfinder.jobsearch.cli as cli
+
+    monkeypatch.setattr(cli.GeminiReranker, "from_env", classmethod(lambda cls: None))
+    rc = main(["rank", "--alerts-dir", str(FIXTURES), "--min-tier", "C", "--rerank"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "VP, AI & Data" in captured.out
+    assert "GEMINI_API_KEY" in captured.err  # warned about the fallback
+    assert "LLM re-rank:" not in captured.out  # no annotation without a re-ranker
+
+
+def test_rerank_not_built_without_flag(capsys, monkeypatch):
+    # A run WITHOUT --rerank must never build the re-ranker (pure Layer-1).
+    import jobfinder.jobsearch.cli as cli
+
+    def _boom(cls):
+        raise AssertionError("from_env must not be called without --rerank")
+
+    monkeypatch.setattr(cli.GeminiReranker, "from_env", classmethod(_boom))
+    rc = main(["rank", "--alerts-dir", str(FIXTURES), "--min-tier", "C"])
+    assert rc == 0
+    assert "LLM re-rank:" not in capsys.readouterr().out
+
+
+def test_rerank_annotation_surfaces_in_output(capsys, monkeypatch):
+    # With a (fake) re-ranker, the LLM's contribution is rendered — never silently
+    # folded into the score.
+    import jobfinder.jobsearch.cli as cli
+    from jobfinder.jobsearch.rerank import RerankedItem, RerankResponse
+
+    class _FakeReranker:
+        def rerank(self, candidates, profile):
+            return RerankResponse(
+                ranking=[
+                    RerankedItem(
+                        candidate_id=i,
+                        relevance="strong",
+                        rationale="great AI leadership scope",
+                    )
+                    for i in range(len(candidates))
+                ]
+            )
+
+    monkeypatch.setattr(
+        cli.GeminiReranker, "from_env", classmethod(lambda cls: _FakeReranker())
+    )
+    rc = main(["rank", "--alerts-dir", str(FIXTURES), "--min-tier", "C", "--rerank"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "LLM re-rank:" in out
+    assert "great AI leadership scope" in out
+
+
 def test_empty_gmail_flag_does_not_trigger_oauth(capsys, monkeypatch):
     # An empty-string --gmail-label must count as "not requested" (matching
     # _run_rank's `not args.gmail_*` check), so a run with a real --alerts-dir

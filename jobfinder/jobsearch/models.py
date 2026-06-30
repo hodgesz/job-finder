@@ -110,6 +110,26 @@ class DimensionScore:
 
 
 @dataclass(frozen=True)
+class LlmRerank:
+    """An optional Layer-2 (LLM) judgement attached to a Layer-1 ``JobMatch``.
+
+    The deterministic Layer-1 score/tier stay authoritative and unchanged; this
+    is an *additive* annotation recording how a Gemini relevance pass re-ordered
+    the top-N candidates and why. Surfacing it (rather than silently mutating the
+    score) preserves the same explainability invariant as the dimension
+    breakdown — a human can see the LLM's contribution and reasoning.
+
+    ``rank`` is the LLM's 1-based ordering position within the candidate set;
+    ``relevance`` is its coarse verdict (e.g. "strong"/"moderate"/"weak");
+    ``rationale`` is its one-line justification.
+    """
+
+    rank: int
+    relevance: str
+    rationale: str
+
+
+@dataclass(frozen=True)
 class JobMatch:
     """A canonical job plus its deterministic fit assessment.
 
@@ -117,7 +137,8 @@ class JobMatch:
     summary; ``risks`` are caveats (e.g. "location may require relocation");
     ``dimensions`` is the per-dimension breakdown the score is built from.
     ``rejected`` marks a hard negative-filter hit (an IC role, an internship)
-    that disqualifies the job regardless of other dimensions.
+    that disqualifies the job regardless of other dimensions. ``llm`` is an
+    optional Layer-2 re-rank annotation (``None`` for a pure Layer-1 result).
     """
 
     job: CanonicalJob
@@ -127,3 +148,4 @@ class JobMatch:
     dimensions: list[DimensionScore] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     rejected: bool = False
+    llm: LlmRerank | None = None
