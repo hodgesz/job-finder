@@ -45,19 +45,19 @@ _TARGET_TEMPLATE: tuple[tuple[ContactRole, str, str, str], ...] = (
         'OR "Chief AI Officer")',
     ),
     (
-        ContactRole.EXECUTIVE,
-        "CEO / founder (executive sponsor)",
-        "For a senior exec hire the CEO or a founder is often directly involved; "
-        "a warm note here can route you straight to the decision-maker.",
-        '"{company}" (CEO OR founder OR "Chief Executive Officer")',
-    ),
-    (
         ContactRole.FUNCTION_LEADER,
         "Existing AI / data / analytics leadership",
         "Current VP/Head/Director of AI, Data or Analytics — a peer or the person "
         "you'd succeed or sit beside; they shape the role and can refer you in.",
         '"{company}" (VP OR Head OR Director) (AI OR "data science" OR '
         '"machine learning" OR analytics)',
+    ),
+    (
+        ContactRole.EXECUTIVE,
+        "CEO / founder (executive sponsor)",
+        "For a senior exec hire the CEO or a founder is often directly involved; "
+        "a warm note here can route you straight to the decision-maker.",
+        '"{company}" (CEO OR founder OR "Chief Executive Officer")',
     ),
     (
         ContactRole.RECRUITER,

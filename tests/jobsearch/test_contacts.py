@@ -39,6 +39,19 @@ def test_target_list_is_deterministic():
     assert target_contacts(_job()) == target_contacts(_job())
 
 
+def test_target_list_order_matches_documented_priority():
+    # Regression: the function leader (a peer/referrer) must come BEFORE the
+    # executive sponsor, matching the module's documented outreach order — the
+    # template once listed EXECUTIVE before FUNCTION_LEADER, contradicting it.
+    roles = [t.role for t in target_contacts(_job())]
+    assert roles == [
+        ContactRole.HIRING_MANAGER,
+        ContactRole.FUNCTION_LEADER,
+        ContactRole.EXECUTIVE,
+        ContactRole.RECRUITER,
+    ]
+
+
 def test_no_company_yields_no_targets():
     assert target_contacts(_job(company="")) == []
 
