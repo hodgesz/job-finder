@@ -124,10 +124,19 @@ class GmailSource:
         be given; with neither, every message is scanned (capped). Non-alert
         messages contribute nothing — ``parse_alert_email`` returns ``[]`` for
         anything it can't read — so a broad query is tolerated.
+
+        A *single* message that fails to fetch or decode is skipped rather than
+        aborting the whole run: a message can be deleted between ``list`` and
+        ``get`` (a 404), or carry a malformed ``raw`` payload. This mirrors the
+        offline ``read_eml_dir``/``parse_alert_email`` contract that a mixed
+        mailbox is tolerated — one bad message must not lose every other match.
         """
         postings: list[RawPosting] = []
         for message_id in self._list_message_ids(label=label, query=query):
-            raw = self._fetch_raw(message_id)
+            try:
+                raw = self._fetch_raw(message_id)
+            except Exception:  # transient get failure / 404 / bad payload — skip
+                continue
             if raw:
                 postings.extend(parse_alert_email(raw))
         return postings

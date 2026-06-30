@@ -122,7 +122,12 @@ class FakeGmailService:
 
     def get_message(self, message_id, *, fmt):
         assert fmt == "raw"  # the source must request the full RFC-822 body
-        return {"raw": self._messages[message_id]["raw"]}
+        msg = self._messages[message_id]
+        if msg.get("error"):
+            # Simulate a message deleted between list and get (a 404), or any
+            # transient per-message API failure.
+            raise RuntimeError(f"gmail get failed for {message_id}")
+        return {"raw": msg["raw"]}
 
 
 def _service_from_eml(names, *, labels=(), page_size=None, label_map=None):
@@ -175,6 +180,28 @@ def test_non_alert_message_contributes_nothing():
 def test_empty_inbox_yields_no_postings():
     service = FakeGmailService(messages={})
     assert GmailSource(service).fetch_postings() == []
+
+
+def test_one_failed_message_does_not_abort_the_run():
+    # A message deleted between list and get (a 404) or any transient per-message
+    # get failure must be skipped, not abort the whole run — mirroring the
+    # offline "tolerate a mixed mailbox" contract. The good alert still comes
+    # through.
+    service = _service_from_eml(["li_alert_single.eml"])
+    service._messages["bad"] = {"raw": "", "error": True, "labelIds": [], "text": ""}
+    postings = GmailSource(service).fetch_postings()
+    assert [p.title for p in postings] == ["VP of AI & Analytics"]
+
+
+def test_malformed_raw_payload_is_skipped():
+    # A bad base64url ``raw`` payload that makes decoding raise must be skipped
+    # rather than aborting the run.
+    service = _service_from_eml(["li_alert_single.eml"])
+    # A single web-safe char is an invalid base64 length → urlsafe_b64decode
+    # raises binascii.Error even after our padding.
+    service._messages["junk"] = {"raw": "a", "labelIds": [], "text": ""}
+    postings = GmailSource(service).fetch_postings()
+    assert [p.title for p in postings] == ["VP of AI & Analytics"]
 
 
 def test_query_filters_messages_and_is_passed_through():
