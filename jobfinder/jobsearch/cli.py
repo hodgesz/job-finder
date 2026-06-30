@@ -25,8 +25,23 @@ from datetime import datetime, timezone
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from jobfinder.jobsearch.contacts import render_checklist, target_contacts
+from jobfinder.jobsearch.email_format import (
+    guess_emails,
+    is_personal_domain,
+    normalize_domain,
+)
 from jobfinder.jobsearch.match import rank_jobs
-from jobfinder.jobsearch.models import ApplicationStatus, JobMatch, RawPosting, Tier
+from jobfinder.jobsearch.models import (
+    ApplicationStatus,
+    Contact,
+    ContactRole,
+    ContactSource,
+    EmailGuess,
+    JobMatch,
+    RawPosting,
+    Tier,
+)
 from jobfinder.jobsearch.normalize import canonicalize, job_key
 from jobfinder.jobsearch.profile import LIVE_DIMENSIONS, VP_AI_PROFILE
 from jobfinder.jobsearch.rerank import (
@@ -40,7 +55,7 @@ from jobfinder.jobsearch.sources.gmail import (
     DEFAULT_CRED_DIR,
     GmailSource,
 )
-from jobfinder.jobsearch.store import JobStore, StoredJob
+from jobfinder.jobsearch.store import JobStore, StoredContact, StoredJob
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard
 
 _TIER_ORDER = {Tier.A: 0, Tier.B: 1, Tier.C: 2}
@@ -278,43 +293,268 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_job_id(store: JobStore, fragment: str, *, cmd: str) -> str | None:
+    """Resolve an unambiguous leading id fragment to a full job_key, or None.
+
+    Prints a clear error to stderr (and returns None) when the fragment is empty,
+    matches nothing, or is ambiguous — so the caller just returns rc 2. Shared by
+    every subcommand that takes a JOB_ID (status/contacts/add-contact) so the
+    resolution rules can't drift between them. (`email` takes name+domain, not a
+    job id, so it does not use this.)
+    """
+    # An empty fragment would "match" every row via the prefix scan; require a real
+    # fragment so e.g. `status --db x '' applied` can't silently hit the sole row.
+    if not fragment:
+        print(
+            f"{cmd}: provide a job id (or a leading fragment); see `list`.",
+            file=sys.stderr,
+        )
+        return None
+    matches = store.find_ids(fragment)
+    if not matches:
+        print(f"{cmd}: no job id starting with {fragment!r}.", file=sys.stderr)
+        return None
+    if len(matches) > 1:
+        print(
+            f"{cmd}: {fragment!r} is ambiguous ({len(matches)} jobs); "
+            "use a longer id fragment:",
+            file=sys.stderr,
+        )
+        for mid in matches:
+            print(f"  {mid}", file=sys.stderr)
+        return None
+    return matches[0]
+
+
 def _run_status(args: argparse.Namespace) -> int:
     try:
         store = _open_store(args.db)
     except SQLAlchemyError as exc:
         print(f"status: could not open {args.db}: {exc}", file=sys.stderr)
         return 2
-    # An empty fragment would "match" every row via the prefix scan; require a
-    # real fragment so `status --db x '' applied` can't silently mutate the sole
-    # stored job (it would slip past the >1-match ambiguity guard).
-    if not args.job_id:
-        print(
-            "status: provide a job id (or a leading fragment); see `list`.",
-            file=sys.stderr,
-        )
+    job_id = _resolve_job_id(store, args.job_id, cmd="status")
+    if job_id is None:
         return 2
-    # Resolve an unambiguous leading fragment to the full id, so the user need not
-    # paste the whole composite key.
-    matches = store.find_ids(args.job_id)
-    if not matches:
-        print(f"status: no job id starting with {args.job_id!r}.", file=sys.stderr)
-        return 2
-    if len(matches) > 1:
-        print(
-            f"status: {args.job_id!r} is ambiguous ({len(matches)} jobs); "
-            "use a longer id fragment:",
-            file=sys.stderr,
-        )
-        for mid in matches:
-            print(f"  {mid}", file=sys.stderr)
-        return 2
-    job_id = matches[0]
     # set_status returns False if the row vanished between resolution and write —
     # report that rather than printing a false success.
     if not store.set_status(job_id, ApplicationStatus(args.new_status)):
         print(f"status: job {job_id!r} no longer exists.", file=sys.stderr)
         return 2
     print(f"{job_id} → {args.new_status}")
+    return 0
+
+
+def render_contacts(
+    stored: list[StoredContact],
+    *,
+    store: JobStore,
+    provider=None,
+    top_guesses: int = 3,
+) -> str:
+    """Render recorded contacts with confidence-ranked business-email guesses.
+
+    Every email guess is checked against the always-honored do-not-contact list:
+    a suppressed address is never shown, and a contact whose every guess is
+    suppressed (or whose domain is on the list) is marked accordingly. Personal
+    email domains never produce a guess (business emails only).
+    """
+    lines: list[str] = []
+    header = f"{len(stored)} contact(s)"
+    lines.append(header)
+    lines.append("=" * len(header))
+    if not stored:
+        lines.append("")
+        lines.append(
+            "No contacts recorded. Use `contacts` for a checklist, then "
+            "`add-contact` to record who you find."
+        )
+        return "\n".join(lines)
+    for sc in stored:
+        c = sc.contact
+        lines.append("")
+        title = f" — {c.title}" if c.title else ""
+        lines.append(f"[{c.role.value}] {c.name}{title}  ({c.company})")
+        if c.linkedin_url:
+            lines.append(f"   LinkedIn: {c.linkedin_url}")
+        if c.notes:
+            lines.append(f"   Notes: {c.notes}")
+        if not c.email_domain:
+            lines.append("   Email: (no company domain recorded — pass --domain)")
+            continue
+        if is_personal_domain(c.email_domain):
+            lines.append(
+                f"   Email: ({c.email_domain} is a personal domain — "
+                "business emails only, no guess)"
+            )
+            continue
+        # Suppression is applied INSIDE guess_emails (the single producer), so a
+        # do-not-contact address is never constructed. We still detect the
+        # "everything suppressed" case by comparing against an unsuppressed run so
+        # the user is told why no guess appears rather than seeing a bare blank.
+        guesses = guess_emails(
+            c.name, c.email_domain, provider=provider, is_suppressed=store.is_suppressed
+        )
+        if guesses:
+            lines.append("   Email guesses (business; confidence):")
+            for g in guesses[:top_guesses]:
+                lines.append(f"     {_format_guess(g)}")
+        elif guess_emails(c.name, c.email_domain, provider=provider):
+            lines.append(
+                "   Email: (all guesses on the do-not-contact list — suppressed)"
+            )
+        else:
+            lines.append("   Email: (could not construct a business email)")
+    return "\n".join(lines)
+
+
+def _run_contacts(args: argparse.Namespace) -> int:
+    """Show the manual contact checklist for a job, or recorded contacts (--show)."""
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"contacts: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    job_id = _resolve_job_id(store, args.job_id, cmd="contacts")
+    if job_id is None:
+        return 2
+    stored_job = store.get(job_id)
+    if stored_job is None:
+        print(f"contacts: job {job_id!r} no longer exists.", file=sys.stderr)
+        return 2
+    if args.show:
+        print(render_contacts(store.list_contacts(job_id), store=store))
+        return 0
+    job = stored_job.match.job
+    print(render_checklist(job, target_contacts(job)))
+    return 0
+
+
+def _run_add_contact(args: argparse.Namespace) -> int:
+    """Record (paste back) a contact found via manual LinkedIn review."""
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"add-contact: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    job_id = _resolve_job_id(store, args.job_id, cmd="add-contact")
+    if job_id is None:
+        return 2
+    stored_job = store.get(job_id)
+    if stored_job is None:
+        print(f"add-contact: job {job_id!r} no longer exists.", file=sys.stderr)
+        return 2
+    if not args.name.strip():
+        print("add-contact: a contact name is required.", file=sys.stderr)
+        return 2
+    # Normalize the domain to its bare host up front: reject a personal domain,
+    # reject a malformed one (rather than silently storing junk that yields no
+    # guesses later), and store the canonical form so the contact_key matches how
+    # guess_emails/is_suppressed normalize it (no duplicate rows for acme.com vs
+    # https://acme.com/careers).
+    email_domain: str | None = None
+    if args.domain:
+        if is_personal_domain(args.domain):
+            print(
+                f"add-contact: {args.domain!r} is a personal email domain; "
+                "business emails only.",
+                file=sys.stderr,
+            )
+            return 2
+        email_domain = normalize_domain(args.domain)
+        if email_domain is None:
+            print(
+                f"add-contact: {args.domain!r} is not a valid business domain.",
+                file=sys.stderr,
+            )
+            return 2
+    contact = Contact(
+        name=args.name.strip(),
+        company=stored_job.match.job.company,
+        role=ContactRole(args.role),
+        title=args.title,
+        linkedin_url=args.linkedin_url,
+        email_domain=email_domain,
+        source=ContactSource.MANUAL,
+        notes=args.notes,
+    )
+    inserted = store.save_contact(job_id, contact)
+    verb = "Added" if inserted else "Updated"
+    print(f"{verb} contact {contact.name!r} on {job_id}.")
+    return 0
+
+
+def _run_email(args: argparse.Namespace) -> int:
+    """Construct confidence-ranked business-email guesses for a name + domain.
+
+    Always consults the do-not-contact list (``--db`` is required) so the
+    "always honored" guarantee can't be bypassed by omitting a flag. Personal
+    domains are refused; suppressed addresses are never constructed.
+    """
+    if is_personal_domain(args.domain):
+        print(
+            f"email: {args.domain!r} is a personal email domain; business emails only.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"email: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    guesses = guess_emails(args.name, args.domain, is_suppressed=store.is_suppressed)
+    if guesses:
+        print(_render_guesses(args.name, guesses))
+        return 0
+    # Nothing to show: distinguish "all suppressed" from "couldn't construct".
+    if guess_emails(args.name, args.domain):
+        print("email: all guesses are on the do-not-contact list — suppressed.")
+        return 0
+    print(
+        f"email: could not construct a business email for {args.name!r} "
+        f"@ {args.domain!r} (need a full name and a valid business domain).",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _format_guess(g: EmailGuess) -> str:
+    """One-line rendering of an email guess, shared by `email` and `contacts --show`."""
+    return f"{g.email}  [{g.pattern}, {g.confidence:.0%}, {g.provenance}]"
+
+
+def _render_guesses(name: str, guesses: list[EmailGuess]) -> str:
+    lines = [f"Business-email guesses for {name} (confidence):"]
+    lines.extend(f"  {_format_guess(g)}" for g in guesses)
+    return "\n".join(lines)
+
+
+def _run_dnc(args: argparse.Namespace) -> int:
+    """Manage the always-honored do-not-contact list (add / list)."""
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"dnc: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    if args.value:
+        entry = store.add_do_not_contact(args.value, reason=args.reason)
+        if entry is None:
+            print(
+                f"dnc: {args.value!r} is not a valid email or domain.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Do-not-contact: added {entry.kind} {entry.value!r}.")
+        return 0
+    entries = store.list_do_not_contact()
+    if not entries:
+        print("Do-not-contact list is empty.")
+        return 0
+    print(
+        f"Do-not-contact list ({len(entries)} entr{'y' if len(entries) == 1 else 'ies'}):"
+    )
+    for e in entries:
+        reason = f"  — {e.reason}" if e.reason else ""
+        print(f"  [{e.kind}] {e.value}{reason}")
     return 0
 
 
@@ -443,6 +683,94 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[s.value for s in ApplicationStatus],
         help="The new status: " + ", ".join(s.value for s in ApplicationStatus) + ".",
     )
+
+    contacts_p = sub.add_parser(
+        "contacts",
+        help="Show a manual LinkedIn contact checklist for a saved job (or the "
+        "contacts you have recorded, with --show).",
+    )
+    contacts_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database to read."
+    )
+    contacts_p.add_argument(
+        "job_id",
+        metavar="JOB_ID",
+        help="The job id (or an unambiguous leading fragment) — see `list`.",
+    )
+    contacts_p.add_argument(
+        "--show",
+        action="store_true",
+        help="Show contacts already recorded for this job (with business-email "
+        "guesses) instead of the manual search checklist.",
+    )
+
+    add_p = sub.add_parser(
+        "add-contact",
+        help="Record a contact found via manual LinkedIn review (paste-back). "
+        "No scraping: you do the LinkedIn lookup by hand and record the name here.",
+    )
+    add_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database to update."
+    )
+    add_p.add_argument(
+        "job_id",
+        metavar="JOB_ID",
+        help="The job this contact is for (id or unambiguous fragment) — see `list`.",
+    )
+    add_p.add_argument("name", metavar="NAME", help="The person's full name.")
+    add_p.add_argument(
+        "--role",
+        choices=[r.value for r in ContactRole],
+        default=ContactRole.OTHER.value,
+        help="How they relate to the role (default other).",
+    )
+    add_p.add_argument("--title", default=None, help="Their job title, if known.")
+    add_p.add_argument(
+        "--linkedin-url", default=None, help="Their LinkedIn profile URL, if known."
+    )
+    add_p.add_argument(
+        "--domain",
+        default=None,
+        metavar="DOMAIN",
+        help="The company's BUSINESS email domain (e.g. 'acme.com') for email "
+        "guesses. Personal domains are rejected.",
+    )
+    add_p.add_argument("--notes", default=None, help="Free-text notes.")
+
+    email_p = sub.add_parser(
+        "email",
+        help="Construct confidence-ranked BUSINESS email guesses for a name at a "
+        "domain. Personal domains rejected; the do-not-contact list (in --db) is "
+        "always honored.",
+    )
+    email_p.add_argument("name", metavar="NAME", help="The person's full name.")
+    email_p.add_argument(
+        "domain", metavar="DOMAIN", help="The company's business email domain."
+    )
+    email_p.add_argument(
+        "--db",
+        required=True,
+        metavar="PATH",
+        help="The CRM database whose do-not-contact list is honored (always "
+        "consulted so a suppressed address is never constructed).",
+    )
+
+    dnc_p = sub.add_parser(
+        "dnc",
+        help="Manage the do-not-contact list (always honored). With a VALUE, add "
+        "an email or domain; with none, list the current entries.",
+    )
+    dnc_p.add_argument("--db", required=True, metavar="PATH", help="The CRM database.")
+    dnc_p.add_argument(
+        "value",
+        metavar="EMAIL_OR_DOMAIN",
+        nargs="?",
+        default=None,
+        help="An email or bare domain to suppress. Omit to list the current entries.",
+    )
+    dnc_p.add_argument(
+        "--reason", default=None, help="Why this entry is suppressed (optional)."
+    )
     return parser
 
 
@@ -454,6 +782,14 @@ def main(argv: list[str] | None = None) -> int:
         return _run_list(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "contacts":
+        return _run_contacts(args)
+    if args.command == "add-contact":
+        return _run_add_contact(args)
+    if args.command == "email":
+        return _run_email(args)
+    if args.command == "dnc":
+        return _run_dnc(args)
     return 2  # pragma: no cover - argparse enforces a valid command
 
 

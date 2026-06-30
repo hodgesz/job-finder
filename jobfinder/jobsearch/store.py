@@ -47,6 +47,9 @@ from sqlalchemy.pool import StaticPool
 from jobfinder.jobsearch.models import (
     ApplicationStatus,
     CanonicalJob,
+    Contact,
+    ContactRole,
+    ContactSource,
     DimensionScore,
     JobMatch,
     LlmRerank,
@@ -54,6 +57,7 @@ from jobfinder.jobsearch.models import (
     Source,
     Tier,
 )
+from jobfinder.jobsearch.email_format import normalize_domain, parent_domains
 from jobfinder.jobsearch.normalize import job_key
 
 # In-memory SQLite needs a single shared connection or each checkout sees a
@@ -86,6 +90,59 @@ jobs_table = Table(
     Column("status_updated_at", String, nullable=True),
     Column("payload", JSON, nullable=False),
 )
+
+# Contacts discovered for a job (Slice E). Decoupled from the ``jobs`` table
+# schema (it is NOT entangled): a contact references a job by its stable
+# ``job_key`` in ``job_id`` but the two tables are independent, so a contact can
+# exist for a job that was never persisted (the user may record a contact from a
+# manual review before saving the rank run). The composite primary key
+# (job_id, contact_key) makes recording the same person twice idempotent; the
+# full ``Contact`` dataclass round-trips through the JSON ``payload``.
+contacts_table = Table(
+    "contacts",
+    _metadata,
+    Column("job_id", String, primary_key=True),
+    Column("contact_key", String, primary_key=True),  # normalized name|domain
+    Column("name", String, nullable=False),
+    Column("company", String, nullable=False, index=True),
+    Column("role", String, nullable=False, index=True),
+    Column("email_domain", String, nullable=True),
+    Column("first_seen_at", String, nullable=False),
+    Column("last_seen_at", String, nullable=False),
+    Column("payload", JSON, nullable=False),
+)
+
+# The do-not-contact list (Slice E) — ALWAYS honored wherever a contact or email
+# guess could surface. An entry is either a full email address or a bare domain
+# (``kind`` = "email" | "domain"); a domain entry suppresses every address at that
+# domain. The normalized ``value`` is the primary key so adding the same entry
+# twice is idempotent.
+do_not_contact_table = Table(
+    "do_not_contact",
+    _metadata,
+    Column("value", String, primary_key=True),  # normalized email or domain
+    Column("kind", String, nullable=False),  # "email" | "domain"
+    Column("reason", String, nullable=True),
+    Column("added_at", String, nullable=False),
+)
+
+
+@dataclass(frozen=True)
+class StoredContact:
+    """A persisted contact plus its bookkeeping timestamps."""
+
+    contact: Contact
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+
+@dataclass(frozen=True)
+class DoNotContactEntry:
+    """One do-not-contact suppression: an email or a whole domain."""
+
+    value: str
+    kind: str  # "email" | "domain"
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +341,71 @@ def _match_from_payload(d: dict) -> JobMatch:
     )
 
 
+def _contact_to_payload(contact: Contact) -> dict:
+    return {
+        "name": contact.name,
+        "company": contact.company,
+        "role": contact.role.value,
+        "title": contact.title,
+        "linkedin_url": contact.linkedin_url,
+        "email_domain": contact.email_domain,
+        "source": contact.source.value,
+        "notes": contact.notes,
+    }
+
+
+def _contact_from_payload(d: dict) -> Contact:
+    return Contact(
+        name=d["name"],
+        company=d["company"],
+        role=ContactRole(d.get("role", ContactRole.OTHER.value)),
+        title=d.get("title"),
+        linkedin_url=d.get("linkedin_url"),
+        email_domain=d.get("email_domain"),
+        source=ContactSource(d.get("source", ContactSource.MANUAL.value)),
+        notes=d.get("notes"),
+    )
+
+
+def contact_key(contact: Contact) -> str:
+    """Stable per-job identity for a contact: normalized name + email domain.
+
+    Recording the same person (same name, same domain) twice updates in place
+    rather than inserting a duplicate. The domain is included so two distinct
+    people who happen to share a name at different companies don't collide. Both
+    halves use the SAME normalization the rest of the tool uses — the name is
+    whitespace-collapsed lower-case, the domain runs through
+    :func:`normalize_domain` — so a contact recorded as ``acme.com`` and again as
+    ``https://acme.com/careers`` keys identically and updates in place rather than
+    duplicating (an unparseable domain falls back to its stripped lower-case form).
+    """
+    name = " ".join(contact.name.lower().split())
+    raw_domain = (contact.email_domain or "").strip().lower()
+    domain = normalize_domain(raw_domain) or raw_domain
+    return f"{name}|{domain}"
+
+
+def _dnc_normalize(value: str) -> tuple[str, str] | None:
+    """Normalize a do-not-contact entry to ``(normalized_value, kind)`` or None.
+
+    An entry containing ``@`` is treated as a full email (normalized to its
+    lower-cased local@domain); anything else is treated as a bare domain
+    (normalized via :func:`normalize_domain`). Returns ``None`` for an
+    unparseable/empty value so the caller can reject it cleanly.
+    """
+    text = value.strip().lower()
+    if not text:
+        return None
+    if "@" in text:
+        local, _, dom = text.partition("@")
+        norm_dom = normalize_domain(dom)
+        if not local or norm_dom is None:
+            return None
+        return f"{local}@{norm_dom}", "email"
+    norm_dom = normalize_domain(text)
+    return (norm_dom, "domain") if norm_dom else None
+
+
 class JobStore:
     """Durable home for ranked jobs and their application-pipeline status.
 
@@ -477,6 +599,163 @@ class JobStore:
                 .order_by(jobs_table.c.id)
             ).all()
         return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Contacts (Slice E).
+    # ------------------------------------------------------------------ #
+    def save_contact(
+        self, job_id: str, contact: Contact, *, now: datetime | None = None
+    ) -> bool:
+        """Upsert one contact for a job. Returns True if newly inserted.
+
+        Keyed on ``(job_id, contact_key)`` so re-recording the same person updates
+        their details in place rather than duplicating. ``first_seen_at`` is
+        stamped once; ``last_seen_at`` advances each time.
+        """
+        now = now or _utcnow()
+        now_iso = _iso(now)
+        key = contact_key(contact)
+        refreshed = {
+            "name": contact.name,
+            "company": contact.company,
+            "role": contact.role.value,
+            "email_domain": contact.email_domain,
+            "last_seen_at": now_iso,
+            "payload": _contact_to_payload(contact),
+        }
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(contacts_table.c.job_id).where(
+                    (contacts_table.c.job_id == job_id)
+                    & (contacts_table.c.contact_key == key)
+                )
+            ).first()
+            if existing is None:
+                conn.execute(
+                    contacts_table.insert().values(
+                        job_id=job_id,
+                        contact_key=key,
+                        first_seen_at=now_iso,
+                        **refreshed,
+                    )
+                )
+                return True
+            conn.execute(
+                contacts_table.update()
+                .where(
+                    (contacts_table.c.job_id == job_id)
+                    & (contacts_table.c.contact_key == key)
+                )
+                .values(**refreshed)
+            )
+            return False
+
+    def list_contacts(self, job_id: str) -> list[StoredContact]:
+        """All contacts recorded for a job, in first-seen order."""
+        stmt = (
+            select(
+                contacts_table.c.payload,
+                contacts_table.c.first_seen_at,
+                contacts_table.c.last_seen_at,
+            )
+            .where(contacts_table.c.job_id == job_id)
+            .order_by(contacts_table.c.first_seen_at, contacts_table.c.contact_key)
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+        return [
+            StoredContact(
+                contact=_contact_from_payload(payload),
+                first_seen_at=datetime.fromisoformat(first_seen),
+                last_seen_at=datetime.fromisoformat(last_seen),
+            )
+            for payload, first_seen, last_seen in rows
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Do-not-contact list (always honored).
+    # ------------------------------------------------------------------ #
+    def add_do_not_contact(
+        self, value: str, *, reason: str | None = None, now: datetime | None = None
+    ) -> DoNotContactEntry | None:
+        """Add an email or domain to the do-not-contact list (idempotent).
+
+        Returns the normalized :class:`DoNotContactEntry` as actually persisted, or
+        ``None`` if ``value`` couldn't be parsed as an email or a domain. Re-adding
+        an existing entry with a new ``reason`` updates it (and keeps the original
+        ``added_at``); re-adding with no reason leaves the stored reason intact —
+        and the returned entry reflects that stored reason, not the (absent) passed
+        one, so the return value never disagrees with what ``list_do_not_contact``
+        reports.
+        """
+        normalized = _dnc_normalize(value)
+        if normalized is None:
+            return None
+        norm_value, kind = normalized
+        now_iso = _iso(now or _utcnow())
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(do_not_contact_table.c.reason).where(
+                    do_not_contact_table.c.value == norm_value
+                )
+            ).first()
+            if existing is None:
+                conn.execute(
+                    do_not_contact_table.insert().values(
+                        value=norm_value, kind=kind, reason=reason, added_at=now_iso
+                    )
+                )
+                stored_reason = reason
+            elif reason is not None:
+                conn.execute(
+                    do_not_contact_table.update()
+                    .where(do_not_contact_table.c.value == norm_value)
+                    .values(reason=reason)
+                )
+                stored_reason = reason
+            else:
+                # No new reason supplied — keep (and report) the existing one.
+                stored_reason = existing[0]
+        return DoNotContactEntry(value=norm_value, kind=kind, reason=stored_reason)
+
+    def list_do_not_contact(self) -> list[DoNotContactEntry]:
+        """Every do-not-contact entry, value-sorted."""
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    do_not_contact_table.c.value,
+                    do_not_contact_table.c.kind,
+                    do_not_contact_table.c.reason,
+                ).order_by(do_not_contact_table.c.value)
+            ).all()
+        return [DoNotContactEntry(value=v, kind=k, reason=r) for v, k, r in rows]
+
+    def is_suppressed(self, email: str) -> bool:
+        """True if ``email`` (or its domain / a parent domain) is do-not-contact.
+
+        A full-email entry suppresses exactly that address; a domain entry
+        suppresses every address at that domain AND its sub-domains (blocking
+        "acme.com" blocks "careers.acme.com"). This is the always-honored guard
+        every contact/email surface applies before emitting a guess — and
+        ``guess_emails`` itself applies it at the producer, so a suppressed address
+        is never constructed in the first place.
+        """
+        normalized = _dnc_normalize(email)
+        if normalized is None:
+            return False
+        norm_value, kind = normalized
+        # The set of stored values that would suppress this address: the address
+        # itself (when it's an email) plus its domain and every parent domain
+        # (so a domain entry covers sub-domains). One query covers all of them.
+        domain = norm_value.split("@", 1)[1] if kind == "email" else norm_value
+        candidates = {norm_value, *parent_domains(domain)}
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(do_not_contact_table.c.value).where(
+                    do_not_contact_table.c.value.in_(candidates)
+                )
+            ).first()
+        return row is not None
 
     # ------------------------------------------------------------------ #
     # Internals.
