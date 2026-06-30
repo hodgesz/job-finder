@@ -114,6 +114,26 @@ def test_llm_cannot_inject_unknown_jobs():
     assert out[-1].llm is None
 
 
+def test_rank_is_position_among_accepted_not_raw_index():
+    # Regression (Bugbot #28): a skipped invalid/duplicate id must NOT leave a gap
+    # in the displayed rank. With an invalid id FIRST in the LLM list, the first
+    # accepted job is still #1 (not #2), matching the "1-based position within the
+    # candidate set" contract that the CLI renders.
+    matches = _matches("VP of AI", "Head of AI")
+    response = RerankResponse(
+        ranking=[
+            RerankedItem(candidate_id=99, relevance="strong", rationale="ghost"),
+            RerankedItem(candidate_id=1, relevance="strong", rationale="first real"),
+            RerankedItem(candidate_id=1, relevance="weak", rationale="dup"),
+            RerankedItem(candidate_id=0, relevance="moderate", rationale="second"),
+        ]
+    )
+    out = rerank_matches(matches, VP_AI_PROFILE, reranker=_FakeReranker(response))
+    assert [m.llm.rank for m in out] == [1, 2]  # no #1 gap from the skipped ghost
+    assert out[0].llm.rationale == "first real"
+    assert out[1].llm.rationale == "second"
+
+
 def test_duplicate_id_first_mention_wins():
     matches = _matches("VP of AI", "Head of AI")
     response = RerankResponse(

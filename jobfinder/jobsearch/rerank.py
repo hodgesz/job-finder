@@ -183,13 +183,16 @@ def _merge(candidates: list[JobMatch], response: RerankResponse) -> list[JobMatc
     n = len(candidates)
     seen: set[int] = set()
     reranked: list[JobMatch] = []
-    for position, item in enumerate(response.ranking, start=1):
+    for item in response.ranking:
         cid = item.candidate_id
         if cid < 0 or cid >= n or cid in seen:
             continue  # invented or duplicate id — ignore
         seen.add(cid)
+        # rank is the 1-based position among the ACCEPTED items, so skipping an
+        # invalid/duplicate id never leaves a gap (the first kept job is always
+        # #1) — matches what the CLI renders and the LlmRerank docstring promises.
         annotation = LlmRerank(
-            rank=position,
+            rank=len(reranked) + 1,
             relevance=item.relevance,
             rationale=item.rationale.strip(),
         )
