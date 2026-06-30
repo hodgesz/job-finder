@@ -123,3 +123,20 @@ def test_gmail_source_built_lazily_and_merged(capsys, monkeypatch):
     assert rc == 0
     assert built["count"] == 1
     assert "VP of AI" in capsys.readouterr().out
+
+
+def test_empty_gmail_flag_does_not_trigger_oauth(capsys, monkeypatch):
+    # An empty-string --gmail-label must count as "not requested" (matching
+    # _run_rank's `not args.gmail_*` check), so a run with a real --alerts-dir
+    # never touches OAuth and succeeds offline.
+    import jobfinder.jobsearch.cli as cli
+
+    def _boom(cls):  # from_env must not be reached for an empty flag
+        raise AssertionError("from_env should not be called for an empty flag")
+
+    monkeypatch.setattr(cli.GmailSource, "from_env", classmethod(_boom))
+    rc = main(
+        ["rank", "--alerts-dir", str(FIXTURES), "--gmail-label", "", "--min-tier", "C"]
+    )
+    assert rc == 0
+    assert "VP, AI & Data" in capsys.readouterr().out

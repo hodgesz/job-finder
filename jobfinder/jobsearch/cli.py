@@ -74,8 +74,12 @@ def _fetch_gmail_postings(label: str | None, query: str | None) -> list[RawPosti
     is given), so a run without Gmail flags never touches OAuth. Raises
     ``RuntimeError`` when Gmail was requested but no credentials are on disk, so
     the user gets a clear setup message rather than a silent empty result.
+
+    A falsy value (``None`` or an empty string) counts as "not requested", so a
+    caller passing ``--gmail-label ""`` does not trigger OAuth — matching how
+    ``_run_rank``'s source-presence check treats the flags via ``not args.*``.
     """
-    if label is None and query is None:
+    if not label and not query:
         return []
     source = GmailSource.from_env()
     if source is None:
@@ -84,7 +88,7 @@ def _fetch_gmail_postings(label: str | None, query: str | None) -> list[RawPosti
             f"{CLIENT_SECRET_FILENAME} under {DEFAULT_CRED_DIR} and authorize "
             "once (read-only). See jobfinder/jobsearch/sources/gmail.py."
         )
-    return source.fetch_postings(label=label, query=query)
+    return source.fetch_postings(label=label or None, query=query or None)
 
 
 def render(matches: list[JobMatch], *, top: int, min_tier: Tier) -> str:
