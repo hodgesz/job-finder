@@ -23,9 +23,11 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from jobfinder.jobsearch.match import rank_jobs
-from jobfinder.jobsearch.models import JobMatch, RawPosting, Tier
-from jobfinder.jobsearch.normalize import canonicalize
+from jobfinder.jobsearch.models import ApplicationStatus, JobMatch, RawPosting, Tier
+from jobfinder.jobsearch.normalize import canonicalize, job_key
 from jobfinder.jobsearch.profile import LIVE_DIMENSIONS, VP_AI_PROFILE
 from jobfinder.jobsearch.rerank import (
     DEFAULT_RERANK_TOP,
@@ -38,9 +40,19 @@ from jobfinder.jobsearch.sources.gmail import (
     DEFAULT_CRED_DIR,
     GmailSource,
 )
+from jobfinder.jobsearch.store import JobStore, StoredJob
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard
 
 _TIER_ORDER = {Tier.A: 0, Tier.B: 1, Tier.C: 2}
+
+
+def _store_url(db: str) -> str:
+    """Map a --db value to a SQLAlchemy URL (mirrors jobfinder.cli._store_url).
+
+    A bare path becomes a local SQLite file; anything already containing ``://``
+    (a full driver URL) is passed through unchanged.
+    """
+    return db if "://" in db else f"sqlite+pysqlite:///{db}"
 
 
 def _parse_ats_spec(spec: str) -> tuple[str, str]:
@@ -192,7 +204,117 @@ def _run_rank(args: argparse.Namespace) -> int:
                 matches, VP_AI_PROFILE, reranker=reranker, top_n=args.rerank_top
             )
 
+    # Optional persistence (opt-in via --db). A run without --db is unchanged:
+    # print-and-forget, no DB touched. With --db, the ranked run is saved in one
+    # transaction; a re-seen job updates in place (status/first_seen_at kept).
+    # Hard-rejected matches (IC roles, internships) are NOT persisted — they are
+    # noise the rank display already hides, so the CRM mirrors what the user sees
+    # rather than filling with disqualified rows. A store/open failure is reported
+    # cleanly (rc 2) instead of crashing AFTER the ranked output is lost.
+    if args.db:
+        keepers = [m for m in matches if not m.rejected]
+        try:
+            result = JobStore(_store_url(args.db)).save_matches(keepers, now=now)
+        except SQLAlchemyError as exc:
+            print(f"rank: could not save to {args.db}: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"Saved to {args.db}: {result.inserted} new, {result.updated} updated.",
+            file=sys.stderr,
+        )
+
     print(render(matches, top=args.top, min_tier=Tier(args.min_tier)))
+    return 0
+
+
+def render_stored(jobs: list[StoredJob]) -> str:
+    """Render persisted CRM jobs as a status-annotated, id-keyed list."""
+    lines: list[str] = []
+    header = f"{len(jobs)} job(s) in the CRM"
+    lines.append(header)
+    lines.append("=" * len(header))
+    if not jobs:
+        lines.append("")
+        lines.append("No jobs match. (Persist a run with `rank --db <path>` first.)")
+        return "\n".join(lines)
+    for sj in jobs:
+        job = sj.match.job
+        lines.append("")
+        lines.append(
+            f"[{sj.status.value}] [{sj.match.tier.value}] {job.title}  —  "
+            f"{job.company}  (score {sj.match.score:.0f}/100)"
+        )
+        lines.append(f"   id: {job_key(job)}")
+        if job.location:
+            lines.append(f"   Location: {job.location}")
+        lines.append(
+            f"   Apply: {job.best_apply_url or '(open LinkedIn listing manually)'}"
+        )
+    return "\n".join(lines)
+
+
+def _open_store(db: str) -> JobStore:
+    """Open (creating if absent) the CRM store, raising SQLAlchemyError on failure.
+
+    Callers wrap this so a bad/unwritable/corrupt --db path yields a clean rc-2
+    message rather than an uncaught traceback.
+    """
+    return JobStore(_store_url(db))
+
+
+def _run_list(args: argparse.Namespace) -> int:
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"list: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    jobs = store.list_jobs(
+        status=ApplicationStatus(args.status) if args.status else None,
+        min_tier=Tier(args.min_tier) if args.min_tier else None,
+        include_archived=args.all,
+        limit=args.top,
+    )
+    print(render_stored(jobs))
+    return 0
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"status: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    # An empty fragment would "match" every row via the prefix scan; require a
+    # real fragment so `status --db x '' applied` can't silently mutate the sole
+    # stored job (it would slip past the >1-match ambiguity guard).
+    if not args.job_id:
+        print(
+            "status: provide a job id (or a leading fragment); see `list`.",
+            file=sys.stderr,
+        )
+        return 2
+    # Resolve an unambiguous leading fragment to the full id, so the user need not
+    # paste the whole composite key.
+    matches = store.find_ids(args.job_id)
+    if not matches:
+        print(f"status: no job id starting with {args.job_id!r}.", file=sys.stderr)
+        return 2
+    if len(matches) > 1:
+        print(
+            f"status: {args.job_id!r} is ambiguous ({len(matches)} jobs); "
+            "use a longer id fragment:",
+            file=sys.stderr,
+        )
+        for mid in matches:
+            print(f"  {mid}", file=sys.stderr)
+        return 2
+    job_id = matches[0]
+    # set_status returns False if the row vanished between resolution and write —
+    # report that rather than printing a false success.
+    if not store.set_status(job_id, ApplicationStatus(args.new_status)):
+        print(f"status: job {job_id!r} no longer exists.", file=sys.stderr)
+        return 2
+    print(f"{job_id} → {args.new_status}")
     return 0
 
 
@@ -266,6 +388,61 @@ def build_parser() -> argparse.ArgumentParser:
         default=Tier.B.value,
         help="Lowest tier to display (A best). Default B.",
     )
+    rank.add_argument(
+        "--db",
+        default=None,
+        metavar="PATH",
+        help="Persist the ranked run to this local CRM database (a SQLite file "
+        "path, or a full driver URL). A re-seen job updates in place, keeping the "
+        "application status you set. Omit for the offline print-and-forget run.",
+    )
+
+    list_p = sub.add_parser(
+        "list",
+        help="List jobs saved in the CRM database, highest score first.",
+    )
+    list_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database to read."
+    )
+    list_p.add_argument(
+        "--status",
+        choices=[s.value for s in ApplicationStatus],
+        default=None,
+        help="Show only jobs in this pipeline status.",
+    )
+    list_p.add_argument(
+        "--min-tier",
+        choices=[t.value for t in Tier],
+        default=None,
+        help="Show only jobs at or above this tier (A best).",
+    )
+    list_p.add_argument(
+        "--all",
+        action="store_true",
+        help="Include ARCHIVED jobs (hidden by default unless --status archived).",
+    )
+    list_p.add_argument(
+        "-n", "--top", type=int, default=None, help="Cap how many jobs to show."
+    )
+
+    status_p = sub.add_parser(
+        "status",
+        help="Set a saved job's application-pipeline status (free transitions).",
+    )
+    status_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database to update."
+    )
+    status_p.add_argument(
+        "job_id",
+        metavar="JOB_ID",
+        help="The job id (or an unambiguous leading fragment) — see `list`.",
+    )
+    status_p.add_argument(
+        "new_status",
+        metavar="STATUS",
+        choices=[s.value for s in ApplicationStatus],
+        help="The new status: " + ", ".join(s.value for s in ApplicationStatus) + ".",
+    )
     return parser
 
 
@@ -273,6 +450,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "rank":
         return _run_rank(args)
+    if args.command == "list":
+        return _run_list(args)
+    if args.command == "status":
+        return _run_status(args)
     return 2  # pragma: no cover - argparse enforces a valid command
 
 

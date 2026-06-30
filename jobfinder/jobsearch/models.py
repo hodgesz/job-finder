@@ -90,6 +90,26 @@ class Tier(str, Enum):
     C = "C"  # likely reject
 
 
+class ApplicationStatus(str, Enum):
+    """Where a job sits in the manual application pipeline (Slice D).
+
+    User-driven: a job is born ``NEW`` on first ingest and only the user advances
+    it. Transitions are free (any status to any other) — this is a single-user
+    personal CRM, so there is no enforced ordering to fight. The status is
+    persisted and is NEVER reset by a later re-ingest of the same job (re-seeing a
+    job refreshes its posting/score fields but keeps the status the user set).
+    ``str`` mixin so it serialises and compares as its value (e.g. ``"applied"``).
+    """
+
+    NEW = "new"  # just ingested, not yet triaged
+    INTERESTED = "interested"  # worth pursuing
+    APPLIED = "applied"  # application submitted
+    INTERVIEWING = "interviewing"  # in the interview loop
+    OFFER = "offer"  # offer received
+    REJECTED = "rejected"  # declined / passed (either direction)
+    ARCHIVED = "archived"  # hidden from the active list
+
+
 @dataclass(frozen=True)
 class DimensionScore:
     """One scored fit dimension: its raw [0,1] score, weight, and a reason.

@@ -19,6 +19,7 @@ Dedupe is layered and conservative (Slice A uses no embeddings):
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 
@@ -147,6 +148,87 @@ def _soft_key(raw: RawPosting) -> tuple[str, frozenset[str], str]:
         _title_signature(normalize_title(raw.title)),
         _location_bucket(raw.location),
     )
+
+
+def job_key(job: CanonicalJob) -> str:
+    """A stable, deterministic identity for a canonical job across runs.
+
+    Persistence (Slice D) keys each row on this so re-ranking a mailbox updates a
+    job in place rather than inserting a fresh anonymous row every run. It is
+    built from the SAME components the in-run soft key dedupes on —
+    ``normalize_company`` + the order-independent title signature + the coarse
+    ``_location_bucket`` — so the persistence identity tracks the dedupe identity
+    (a role that merges within a run also matches its stored row).
+
+    The frozenset title signature is sorted into a stable string so the key is
+    reproducible across processes (set iteration order is not). Apply URLs are
+    deliberately NOT part of the soft key: the same role can surface with a
+    LinkedIn job URL one run and an ATS apply URL the next, and keying on the URL
+    would split it into two rows.
+
+    Blank-company / blank-title fallback: ``canonicalize`` refuses to soft-merge a
+    posting whose company OR title didn't parse (``if soft[0] and soft[1]`` — two
+    blanks must not collapse into one role), merging such postings only on a HARD
+    key (exact apply URL, or ``source:source_job_id``). The soft components are
+    therefore an untrustworthy identity here, so we mirror that exactly: fall back
+    to the same hard key, else a stable hash of the raw fields — so two distinct
+    under-parsed postings get distinct keys (no silent overwrite) just as the
+    in-run dedupe keeps them as distinct rows.
+
+    Why soft-key FIRST (not hard-key first): the common cross-source case is the
+    SAME role seen via a LinkedIn alert one run and an ATS board the next — those
+    carry DIFFERENT hard ids/URLs (LinkedIn job id vs ATS req id), so only the soft
+    key matches them across runs; hard-first precedence would split that case into
+    two rows. The soft key is the right cross-run identity whenever company+title
+    parse.
+
+    Accepted limitation (single-user CRM; documented, not worked around): a role
+    first ingested UNDER-PARSED (keyed ``hard:``/``raw:``) and only LATER enriched
+    enough to compute a soft key transitions keys across runs, so the enriched run
+    inserts a NEW row and any status set on the old id stays on the old row. The
+    fallback path is rare (LinkedIn alerts and ATS boards almost always carry a
+    company + title), and the worst case is a duplicate row whose status is simply
+    re-set — not data loss — so a cross-run key-migration layer is deliberately not
+    worth its complexity here (same spirit as Slice A's accepted merge edges).
+    """
+    company = normalize_company(job.company)
+    signature = "+".join(sorted(_title_signature(normalize_title(job.title))))
+    bucket = _location_bucket(job.location)
+    if company and signature:
+        return f"{company}|{signature}|{bucket}"
+    # Untrustworthy soft key — fall back to a hard identity (matches dedupe).
+    for raw in job.sources:
+        hard = _hard_keys(raw)
+        if hard:
+            return f"hard:{hard[0]}"
+    # No company, no title signature, no hard key: hash the FULL stable content of
+    # the job and every source posting, so two under-parsed jobs that canonicalize
+    # kept separate (sharing only the blank company/title/location but differing in
+    # any other field — department, workplace_type, snippet, source) still get
+    # distinct keys, while re-ingesting the SAME posting reproduces its key.
+    # Hashing only company/title/location would collapse such distinct jobs.
+    parts: list[str] = [
+        job.company,
+        job.title,
+        job.location or "",
+        job.workplace_type or "",
+        job.department or "",
+        job.best_apply_url or "",
+    ]
+    for raw in job.sources:
+        parts += [
+            raw.source.value,
+            raw.title,
+            raw.company,
+            raw.url or "",
+            raw.source_job_id or "",
+            raw.location or "",
+            raw.department or "",
+            raw.snippet or "",
+        ]
+    seed = "\x1f".join(parts)
+    digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).hexdigest()
+    return f"raw:{digest}"
 
 
 def _merge(group: list[RawPosting]) -> CanonicalJob:
