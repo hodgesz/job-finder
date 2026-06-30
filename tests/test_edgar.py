@@ -138,6 +138,32 @@ def test_parse_company_info_reads_sic_sector():
     assert info.name == "Apple Inc."
     assert info.sic == "3571"
     assert info.sic_description == "Electronic Computers"
+    # The header lists the stock exchange(s) the filer trades on -> a free,
+    # honest "is exchange-listed" fact (Slice 17 derives a "public" stage from it).
+    assert info.exchanges == ("Nasdaq",)
+
+
+def test_parse_company_info_exchanges_default_and_blanks():
+    # Missing or blank-only exchanges become an empty tuple (a private/unlisted
+    # filer), so callers never read a stale or empty entry as a listing.
+    no_exch = parse_company_info({"cik": "1", "name": "Priv Co"})
+    assert no_exch.exchanges == ()
+    blanks = parse_company_info(
+        {"cik": "1", "name": "X", "exchanges": ["", "  ", "NYSE"]}
+    )
+    assert blanks.exchanges == ("NYSE",)
+
+
+def test_parse_company_info_exchanges_tolerates_malformed_payload():
+    # The submissions payload is external SEC JSON; guard its shape. A scalar
+    # string must NOT be iterated character-by-character into bogus single-letter
+    # exchanges, and a non-string element must not crash on `.strip()`.
+    scalar = parse_company_info({"cik": "1", "name": "X", "exchanges": "Nasdaq"})
+    assert scalar.exchanges == ()  # not ('N','a','s','d','a','q')
+    mixed = parse_company_info(
+        {"cik": "1", "name": "X", "exchanges": ["Nasdaq", 123, None]}
+    )
+    assert mixed.exchanges == ("Nasdaq",)  # non-strings skipped, no crash
 
 
 def test_parse_company_info_missing_sic_is_none():

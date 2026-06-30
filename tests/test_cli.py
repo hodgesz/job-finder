@@ -25,6 +25,11 @@ from jobfinder.pipeline import CompanyInputs, run_pipeline, run_pipeline_detaile
 from jobfinder.signals.extraction import RegexExtractor
 from jobfinder.sources.ats import AtsClient, JobBoard, JobPosting
 from jobfinder.sources.edgar import EdgarClient, Filing, FormD
+from jobfinder.sources.enrichment import (
+    Enrichment,
+    EnrichmentClient,
+    NullEnrichmentClient,
+)
 from jobfinder.store import Store
 
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
@@ -476,7 +481,13 @@ def _live_companies(client, ciks, *, now):
     this drives the same assembler with cik-only specs.
     """
     return [
-        _build_company(CompanySpec(cik=cik), edgar=client, ats_client=None, now=now)
+        _build_company(
+            CompanySpec(cik=cik),
+            edgar=client,
+            ats_client=None,
+            enrichment_client=NullEnrichmentClient(),
+            now=now,
+        )
         for cik in ciks
     ]
 
@@ -490,8 +501,11 @@ def test_live_company_derives_firmographics_and_real_name():
     # Firmographics are derived from the filer's SIC sector (no extra fetch).
     assert company.firmographics is not None
     assert company.firmographics.sector == "Electronic Computers"
-    # SEC discloses neither, so they stay neutral-by-omission.
-    assert company.firmographics.funding_stage is None
+    # Apple is exchange-listed (Nasdaq), so its funding stage is "public" — a
+    # free, honest derivation from the submissions header (Slice 17).
+    assert company.firmographics.funding_stage == "public"
+    # SEC discloses no headcount, and no enrichment vendor is bound, so it stays
+    # neutral-by-omission.
     assert company.firmographics.employee_count is None
 
 
@@ -551,6 +565,66 @@ def test_live_company_fit_uses_derived_sector():
     )
     assert match[0].fit_score > 0.5 > miss[0].fit_score
     assert "Electronic Computers matches target sector" in match[0].why_now
+
+
+def test_live_public_stage_scores_the_stage_dimension():
+    # Slice 17: the live firmographic now carries funding_stage="public" for an
+    # exchange-listed filer (Apple/Nasdaq), so a candidate targeting "public"
+    # scores the stage dimension exactly — the dimension Slice 9 left neutral.
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"], now=NOW)
+
+    public = run_pipeline(
+        companies,
+        candidate_profile=CandidateProfile(target_stages=("public",)),
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
+    # A candidate targeting an early round scores the stage as FAR (not the old
+    # neutral): "public" is several steps from "series_b" on the progression.
+    early = run_pipeline(
+        companies,
+        candidate_profile=CandidateProfile(target_stages=("series_b",)),
+        observed_at=NOW,
+        now=NOW,
+        extractor=RegexExtractor(),
+    )
+    assert public[0].fit_score > 0.5  # exact stage match lifts fit
+    assert early[0].fit_score < 0.5  # far stage drags it below neutral
+    assert "public in target stage" in public[0].why_now
+
+
+def test_live_public_stage_with_enrichment_disabled_is_only_sec_derived():
+    # With no enrichment vendor bound (the default NullEnrichmentClient), only the
+    # free SEC-derived dimensions appear: sector + the "public" stage. Headcount
+    # stays unknown, so a size-targeting profile scores that dimension neutral.
+    companies = _live_companies(EdgarClient(_edgar_fetcher), ["320193"], now=NOW)
+    firmo = companies[0].firmographics
+    assert firmo.funding_stage == "public"
+    assert firmo.employee_count is None
+
+
+def test_build_company_merges_injected_enrichment_headcount():
+    # The full CLI seam with a stand-in vendor: a bound enrichment client fills the
+    # SEC-blind headcount, while the SEC-derived "public" stage still wins. Proves
+    # _build_company threads the client through and the merge precedence holds.
+    class FakeEnrichmentClient:
+        def enrich(self, *, cik: str | None, name: str) -> Enrichment:
+            return Enrichment(funding_stage="series_a", employee_count=164000)
+
+    client = FakeEnrichmentClient()
+    assert isinstance(client, EnrichmentClient)
+    company = _build_company(
+        CompanySpec(cik="320193"),
+        edgar=EdgarClient(_edgar_fetcher),
+        ats_client=None,
+        enrichment_client=client,
+        now=NOW,
+    )
+    firmo = company.firmographics
+    assert firmo.sector == "Electronic Computers"  # SEC sector
+    assert firmo.funding_stage == "public"  # exchange listing wins over enrichment
+    assert firmo.employee_count == 164000  # enrichment fills the SEC-blind size
 
 
 def test_profile_from_args_none_when_no_flags():
@@ -761,6 +835,7 @@ def test_build_company_joins_sec_and_ats_on_one_record():
         spec,
         edgar=EdgarClient(fetcher),
         ats_client=AtsClient(fetcher),
+        enrichment_client=NullEnrichmentClient(),
         now=NOW,
     )
     # Both sources on the single record, keyed by the CIK.
@@ -780,7 +855,11 @@ def test_joined_company_corroborates_sec_opportunity_with_live_reqs():
     fetcher = _cfo_join_fetcher(board_dept="Finance")
     spec = _parse_company_spec("cik=320193,ats=greenhouse:helix")
     company = _build_company(
-        spec, edgar=EdgarClient(fetcher), ats_client=AtsClient(fetcher), now=NOW
+        spec,
+        edgar=EdgarClient(fetcher),
+        ats_client=AtsClient(fetcher),
+        enrichment_client=NullEnrichmentClient(),
+        now=NOW,
     )
     result = run_pipeline_detailed(
         [company], observed_at=NOW, now=NOW, extractor=RegexExtractor()
@@ -801,7 +880,11 @@ def test_joined_company_off_function_reqs_not_flagged():
     fetcher = _cfo_join_fetcher(board_dept="Sales")
     spec = _parse_company_spec("cik=320193,ats=greenhouse:helix")
     company = _build_company(
-        spec, edgar=EdgarClient(fetcher), ats_client=AtsClient(fetcher), now=NOW
+        spec,
+        edgar=EdgarClient(fetcher),
+        ats_client=AtsClient(fetcher),
+        enrichment_client=NullEnrichmentClient(),
+        now=NOW,
     )
     result = run_pipeline_detailed(
         [company], observed_at=NOW, now=NOW, extractor=RegexExtractor()
