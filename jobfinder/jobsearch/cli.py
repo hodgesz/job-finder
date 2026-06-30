@@ -27,6 +27,11 @@ from jobfinder.jobsearch.match import rank_jobs
 from jobfinder.jobsearch.models import JobMatch, RawPosting, Tier
 from jobfinder.jobsearch.normalize import canonicalize
 from jobfinder.jobsearch.profile import LIVE_DIMENSIONS, VP_AI_PROFILE
+from jobfinder.jobsearch.rerank import (
+    DEFAULT_RERANK_TOP,
+    GeminiReranker,
+    rerank_matches,
+)
 from jobfinder.jobsearch.sources.eml_dir import read_eml_dir
 from jobfinder.jobsearch.sources.gmail import (
     CLIENT_SECRET_FILENAME,
@@ -127,6 +132,13 @@ def render(matches: list[JobMatch], *, top: int, min_tier: Tier) -> str:
         ]
         if live:
             lines.append(f"   Breakdown: {', '.join(live)}")
+        # Layer-2 (LLM) contribution, when an opt-in --rerank pass annotated this
+        # match. Surfaced (not folded into the score) so a human sees why the LLM
+        # moved a job — the Layer-1 score above stays authoritative.
+        if m.llm is not None:
+            lines.append(
+                f"   LLM re-rank: #{m.llm.rank} ({m.llm.relevance}) — {m.llm.rationale}"
+            )
         lines.append(f"   Sources: {', '.join(job.source_kinds)}")
         lines.append(
             f"   Apply: {job.best_apply_url or '(open LinkedIn listing manually)'}"
@@ -160,6 +172,26 @@ def _run_rank(args: argparse.Namespace) -> int:
     jobs = canonicalize(raw_postings, boards)
     now = datetime.now(timezone.utc)
     matches = rank_jobs(jobs, VP_AI_PROFILE, now=now)
+
+    # Optional Layer-2 LLM re-rank over the top-N (opt-in via --rerank). Built
+    # lazily and only when a key exists; with no key the re-ranker is None and
+    # rerank_matches returns the Layer-1 order unchanged — a run without the flag
+    # (or without a key) is pure Layer 1.
+    if args.rerank:
+        reranker = GeminiReranker.from_env()
+        if reranker is None:
+            # No key → warn and stay on Layer-1 (don't re-resolve from_env inside
+            # rerank_matches, which would just return None again).
+            print(
+                "rank: --rerank needs GEMINI_API_KEY set; "
+                "falling back to deterministic Layer-1 ranking.",
+                file=sys.stderr,
+            )
+        else:
+            matches = rerank_matches(
+                matches, VP_AI_PROFILE, reranker=reranker, top_n=args.rerank_top
+            )
+
     print(render(matches, top=args.top, min_tier=Tier(args.min_tier)))
     return 0
 
@@ -212,6 +244,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rank.add_argument(
         "-n", "--top", type=int, default=10, help="How many matches to show."
+    )
+    rank.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Opt-in Layer-2 Gemini relevance re-rank over the top-N candidates "
+        "(needs GEMINI_API_KEY). Degrades to deterministic Layer-1 without a key "
+        "or on any LLM error; the Layer-1 score stays authoritative.",
+    )
+    rank.add_argument(
+        "--rerank-top",
+        type=int,
+        default=DEFAULT_RERANK_TOP,
+        metavar="N",
+        help=f"How many top Layer-1 candidates to send to the LLM re-ranker "
+        f"(cost control; default {DEFAULT_RERANK_TOP}). Only used with --rerank.",
     )
     rank.add_argument(
         "--min-tier",
