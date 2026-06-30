@@ -32,6 +32,13 @@ htmlcov/
 .env.*
 *.local
 
+# Gmail OAuth credentials (jobsearch detour, Slice B) — never commit secrets.
+# Default location is ~/.config/job-finder/; also ignore any repo-local copies.
+gmail_client_secret.json
+gmail_token.json
+client_secret*.json
+token.json
+
 # Logs
 *.log
 
