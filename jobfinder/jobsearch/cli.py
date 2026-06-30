@@ -9,7 +9,9 @@ optionally, public ATS boards), de-duplicates, scores each job against the
 VP-of-AI target profile, and prints a ranked, tiered, evidence-cited list. It is
 fully offline when only ``--alerts-dir`` is given; ``--ats`` adds a network fetch
 of the named public boards (SEC-style descriptive User-Agent required, reusing the
-core ``AtsClient``).
+core ``AtsClient``). ``--gmail-label``/``--gmail-query`` read the same LinkedIn
+alert emails live from the user's mailbox (read-only OAuth) instead of exported
+``.eml`` files, producing the same postings.
 
 Deliberately separate from ``jobfinder.cli`` (the core opportunity-intelligence
 CLI), so the core tool is untouched.
@@ -22,10 +24,15 @@ import sys
 from datetime import datetime, timezone
 
 from jobfinder.jobsearch.match import rank_jobs
-from jobfinder.jobsearch.models import JobMatch, Tier
+from jobfinder.jobsearch.models import JobMatch, RawPosting, Tier
 from jobfinder.jobsearch.normalize import canonicalize
 from jobfinder.jobsearch.profile import LIVE_DIMENSIONS, VP_AI_PROFILE
 from jobfinder.jobsearch.sources.eml_dir import read_eml_dir
+from jobfinder.jobsearch.sources.gmail import (
+    CLIENT_SECRET_FILENAME,
+    DEFAULT_CRED_DIR,
+    GmailSource,
+)
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard
 
 _TIER_ORDER = {Tier.A: 0, Tier.B: 1, Tier.C: 2}
@@ -58,6 +65,26 @@ def _fetch_boards(specs: list[str], user_agent: str | None) -> list[JobBoard]:
         provider, token = _parse_ats_spec(spec)
         boards.append(client.fetch_board(provider, token))
     return boards
+
+
+def _fetch_gmail_postings(label: str | None, query: str | None) -> list[RawPosting]:
+    """Read LinkedIn alert emails live from Gmail when requested.
+
+    Builds the source lazily (and only when ``--gmail-label``/``--gmail-query``
+    is given), so a run without Gmail flags never touches OAuth. Raises
+    ``RuntimeError`` when Gmail was requested but no credentials are on disk, so
+    the user gets a clear setup message rather than a silent empty result.
+    """
+    if label is None and query is None:
+        return []
+    source = GmailSource.from_env()
+    if source is None:
+        raise RuntimeError(
+            "--gmail-label/--gmail-query needs Gmail credentials on disk: place "
+            f"{CLIENT_SECRET_FILENAME} under {DEFAULT_CRED_DIR} and authorize "
+            "once (read-only). See jobfinder/jobsearch/sources/gmail.py."
+        )
+    return source.fetch_postings(label=label, query=query)
 
 
 def render(matches: list[JobMatch], *, top: int, min_tier: Tier) -> str:
@@ -106,16 +133,23 @@ def render(matches: list[JobMatch], *, top: int, min_tier: Tier) -> str:
 
 
 def _run_rank(args: argparse.Namespace) -> int:
-    if not args.alerts_dir and not args.ats:
+    if (
+        not args.alerts_dir
+        and not args.ats
+        and not args.gmail_label
+        and not args.gmail_query
+    ):
         print(
-            "rank: provide at least one source (--alerts-dir and/or --ats).",
+            "rank: provide at least one source "
+            "(--alerts-dir, --gmail-label/--gmail-query, and/or --ats).",
             file=sys.stderr,
         )
         return 2
     try:
         raw_postings = read_eml_dir(args.alerts_dir) if args.alerts_dir else []
+        raw_postings += _fetch_gmail_postings(args.gmail_label, args.gmail_query)
         boards = _fetch_boards(args.ats, args.user_agent)
-    except (ValueError, NotADirectoryError) as exc:
+    except (ValueError, NotADirectoryError, RuntimeError) as exc:
         print(f"rank: {exc}", file=sys.stderr)
         return 2
 
@@ -151,6 +185,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PROVIDER:TOKEN",
         help="Public ATS board as 'provider:token' (repeatable), e.g. "
         "'greenhouse:databricks'. Requires --user-agent.",
+    )
+    rank.add_argument(
+        "--gmail-label",
+        default=None,
+        metavar="LABEL",
+        help="Read LinkedIn alert emails live from this Gmail label, e.g. "
+        "'job-alerts' (read-only OAuth; needs credentials under "
+        f"{DEFAULT_CRED_DIR}). Combinable with --gmail-query.",
+    )
+    rank.add_argument(
+        "--gmail-query",
+        default=None,
+        metavar="QUERY",
+        help="Read LinkedIn alert emails live matching this Gmail search, e.g. "
+        "'from:jobalerts-noreply@linkedin.com'. Combinable with --gmail-label.",
     )
     rank.add_argument(
         "--user-agent",

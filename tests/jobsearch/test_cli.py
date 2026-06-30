@@ -72,3 +72,54 @@ def test_parse_ats_spec_rejects_unknown_provider():
     with pytest.raises(ValueError):
         _parse_ats_spec("monster:acme")
     assert _parse_ats_spec("greenhouse:acme") == ("greenhouse", "acme")
+
+
+def test_gmail_request_without_credentials_errors(capsys, monkeypatch):
+    # Asking for Gmail ingestion with no credentials on disk fails with a clear
+    # setup message (rc 2), rather than silently ranking nothing.
+    import jobfinder.jobsearch.cli as cli
+
+    monkeypatch.setattr(cli.GmailSource, "from_env", classmethod(lambda cls: None))
+    rc = main(["rank", "--gmail-label", "job-alerts"])
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "gmail" in err and "credentials" in err
+
+
+def test_gmail_source_built_lazily_and_merged(capsys, monkeypatch):
+    # When --gmail-query is given, the source is built and its postings join the
+    # ranking; when it is absent, from_env is never called (no OAuth on offline
+    # runs).
+    import jobfinder.jobsearch.cli as cli
+    from jobfinder.jobsearch.models import RawPosting, Source
+
+    built = {"count": 0}
+
+    class _FakeSource:
+        def fetch_postings(self, *, label=None, query=None):
+            return [
+                RawPosting(
+                    title="VP of AI",
+                    company="Acme",
+                    source=Source.LINKEDIN_ALERT,
+                    location="Remote",
+                    url="https://www.linkedin.com/comm/jobs/view/1/",
+                )
+            ]
+
+    def _fake_from_env(cls):
+        built["count"] += 1
+        return _FakeSource()
+
+    monkeypatch.setattr(cli.GmailSource, "from_env", classmethod(_fake_from_env))
+
+    # Offline run: Gmail source must NOT be built.
+    rc = main(["rank", "--alerts-dir", str(FIXTURES), "--min-tier", "C"])
+    assert rc == 0
+    assert built["count"] == 0
+
+    # Gmail run: source built once, its posting reaches the ranking.
+    rc = main(["rank", "--gmail-query", "from:jobalerts-noreply@linkedin.com"])
+    assert rc == 0
+    assert built["count"] == 1
+    assert "VP of AI" in capsys.readouterr().out
