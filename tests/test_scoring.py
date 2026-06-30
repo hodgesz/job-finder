@@ -10,6 +10,7 @@ from jobfinder.scoring import (
     WEIGHTS,
     build_opportunity,
     derive_persona,
+    match_persona,
     rank_opportunities,
     score_company,
 )
@@ -389,6 +390,50 @@ def test_derive_persona_multi_role_follows_listed_order_not_table_order():
     )
     persona_rev, _ = derive_persona([sig_rev])
     assert persona_rev == "CFO / VP Finance"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The corporate-finance FUNCTION still maps to the CFO persona: the bare
+        # word, real finance titles, a department literally named "Finance".
+        ("Finance", "CFO / VP Finance"),
+        ("VP Finance", "CFO / VP Finance"),
+        ("Head of Finance", "CFO / VP Finance"),
+        ("Corporate Finance", "CFO / VP Finance"),
+        ("Finance & Accounting", "CFO / VP Finance"),
+        ("Finance Operations", "CFO / VP Finance"),
+        ("Chief Financial Officer", "CFO / VP Finance"),
+        ("CFO", "CFO / VP Finance"),
+        ("Controller", "CFO / VP Finance"),
+        ("Comptroller Finance", "CFO / VP Finance"),
+        ("FP&A Manager", "CFO / VP Finance"),
+        # ...but "Finance" as a product/market-domain word inside a GTM/Sales
+        # sub-org must NOT read as the CFO function (live finding E, Toast
+        # "Embedded Finance"). These merely *contain* the word.
+        ("Embedded Finance", None),
+        ("Embedded Finance Engineer", None),
+        ("Finance Solutions", None),
+        ("Finance Products", None),
+    ],
+)
+def test_match_persona_finance_function_not_product_domain(text, expected):
+    assert match_persona([text]) == expected
+
+
+def test_derive_persona_embedded_finance_is_not_cfo():
+    # An ATS surge in an "Embedded Finance" department (a Sales/GTM product
+    # org) must not derive the CFO persona; the rule no longer matches it, so a
+    # surge whose only fragment is that department falls back to the default.
+    surge = _signal(
+        "s-emb",
+        "department_surge",
+        strength=0.8,
+        facts={"department": "Embedded Finance"},
+    )
+    persona, source = derive_persona([surge])
+    assert persona == DEFAULT_PERSONA
+    assert source is None
 
 
 def test_derive_persona_vacuum_wins_over_surge():

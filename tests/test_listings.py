@@ -102,6 +102,31 @@ def test_in_function_matches_department_first_like_scorer():
     assert corro_sales.in_function == 0
 
 
+def test_embedded_finance_reqs_not_in_function_for_cfo():
+    # Live finding E (Toast, 2026-06-29): a genuine CFO-departure opportunity's
+    # in-function corroboration wrongly flagged "Embedded Finance" reqs (a
+    # Sales/GTM product sub-org — lending/underwriting/payments product that
+    # merely contains the word "Finance") as in-function. The real corporate
+    # Finance reqs must STILL flag in-function; only the product-domain ones drop.
+    board = _board(
+        [
+            _posting("1", "Controller", department="Finance", days_ago=3),
+            _posting("2", "FP&A Manager", department="Finance", days_ago=4),
+            _posting("3", "Account Manager", department="Embedded Finance", days_ago=2),
+            _posting(
+                "4", "Embedded Finance Sales Lead", department="Sales", days_ago=2
+            ),
+        ]
+    )
+    corro = corroborate_roles([board], target_persona="CFO / VP Finance", now=NOW)
+    assert corro.total == 4
+    # Only the two real corporate-Finance reqs are in-function; the two
+    # product-domain "Embedded Finance" reqs are not.
+    assert corro.in_function == 2
+    in_function_titles = {r.title for r in corro.sample if r.in_function}
+    assert in_function_titles == {"Controller", "FP&A Manager"}
+
+
 def test_in_function_falls_back_to_title_when_no_department():
     # With no department/team, the title is the only fragment, so a "Revenue
     # Operations Lead" with no department reads as sales (CRO) by title.

@@ -139,8 +139,29 @@ _PERSONA_SIGNAL_PRIORITY = (
 _PERSONA_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(pat, re.IGNORECASE), persona)
     for pat, persona in (
+        # The bare word "finance" means the corporate-finance FUNCTION a CFO
+        # leads (FP&A / controller / treasury / accounting), EXCEPT when it is a
+        # product/market-domain word inside a GTM/Sales sub-org. "Embedded
+        # Finance" (lending/underwriting/payments product), "Finance Solutions",
+        # and "Finance Products" merely *contain* the word and are not the CFO's
+        # function. Live finding E (2026-06-29, validated on Toast): a genuine
+        # CFO-departure opportunity's in-function corroboration wrongly flagged
+        # Toast "Embedded Finance" reqs as in-function. Guards keep the bare
+        # function word matching (a dept literally named "Finance", "VP
+        # Finance", "Comptroller Finance") while excluding those product
+        # phrases. (Note "chief financial officer"/"financial" are unaffected —
+        # "financial" does not contain the substring "finance".)
+        #
+        # Scope is deliberately the validated homonyms (the live finding plus
+        # the two obvious "Finance <product>" siblings), matched as they appear
+        # in structured ATS department fields. Other product-domain "X Finance"
+        # phrasings (e.g. trade/consumer/project finance) are the same bare-token
+        # over-match class but are NOT guarded here — generalizing the guard was
+        # explicitly out of this finance-only slice's scope.
         (
-            r"chief financial officer|\bCFO\b|finance|controller|accounting|FP&A",
+            r"chief financial officer|\bCFO\b"
+            r"|(?<!embedded )finance(?!\s+(?:solutions?|products?))"
+            r"|controller|accounting|FP&A",
             "CFO / VP Finance",
         ),
         (
