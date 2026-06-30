@@ -1,0 +1,21 @@
+From: LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>
+To: jobseeker@example.com
+Subject: "VP of AI": your job alert
+Date: Mon, 29 Jun 2026 09:15:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BOUND"
+
+--BOUND
+Content-Type: text/plain; charset="utf-8"
+
+Your job alert for VP of AI
+VP of AI - Hooli - Remote (United States)
+Head of Data Science - Pied Piper - New York, NY
+--BOUND
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<p>Your job alert for VP of AI</p>
+<p>Open this email in a browser to view your jobs.</p>
+</body></html>
+--BOUND--

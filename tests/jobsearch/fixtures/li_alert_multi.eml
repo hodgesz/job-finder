@@ -1,0 +1,41 @@
+From: LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>
+To: jobseeker@example.com
+Subject: "VP of AI": Acme Corp is hiring
+Date: Mon, 29 Jun 2026 09:15:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BOUND"
+
+--BOUND
+Content-Type: text/plain; charset="utf-8"
+
+Your job alert for VP of AI
+VP, AI & Data - Acme Corp - Remote (United States)
+View job
+Head of Machine Learning - Globex - San Francisco, CA
+View job
+--BOUND
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<style>.x { color: red; }</style>
+<table>
+<tr><td>
+  <a href="https://www.linkedin.com/comm/jobs/view/3811111111/?trk=eml">VP, AI &amp; Data</a>
+  <p>Acme Corp &middot; Remote (United States)</p>
+  <span>Actively recruiting</span>
+  <a href="https://www.linkedin.com/comm/jobs/view/3811111111/?trk=eml2">View job</a>
+</td></tr>
+<tr><td>
+  <a href="https://www.linkedin.com/comm/jobs/view/3822222222/?trk=eml">Head of Machine Learning</a>
+  <p>Globex &middot; San Francisco, CA (Hybrid)</p>
+  <a href="https://www.linkedin.com/comm/jobs/view/3822222222/?trk=eml2">View job</a>
+</td></tr>
+<tr><td>
+  <a href="https://www.linkedin.com/comm/jobs/view/3833333333/?trk=eml">Senior Machine Learning Engineer</a>
+  <p>Initech &middot; Austin, TX</p>
+  <a href="https://www.linkedin.com/comm/jobs/view/3833333333/?trk=eml2">View job</a>
+</td></tr>
+</table>
+<a href="https://www.linkedin.com/comm/unsubscribe">Unsubscribe</a>
+</body></html>
+--BOUND--

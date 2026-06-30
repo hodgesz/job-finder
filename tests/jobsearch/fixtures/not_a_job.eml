@@ -1,0 +1,11 @@
+From: Newsletter <news@example.com>
+To: jobseeker@example.com
+Subject: Your weekly digest
+Date: Fri, 26 Jun 2026 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<h1>This week in tech</h1>
+<a href="https://example.com/article/123">Read more</a>
+</body></html>
