@@ -169,3 +169,85 @@ class JobMatch:
     risks: list[str] = field(default_factory=list)
     rejected: bool = False
     llm: LlmRerank | None = None
+
+
+class ContactRole(str, Enum):
+    """How a person relates to a job, for ranking who to reach out to (Slice E).
+
+    Ordering of *who matters most* is decided in ``contacts``, not here; this only
+    classifies a person. ``str`` mixin so it serialises/compares as its value.
+    """
+
+    HIRING_MANAGER = "hiring_manager"  # owns the req / the role reports to them
+    FUNCTION_LEADER = "function_leader"  # existing AI/data/analytics leadership
+    EXECUTIVE = "executive"  # CEO / founder / C-suite sponsor
+    RECRUITER = "recruiter"  # talent / recruiting owning the search
+    TEAM = "team"  # a would-be peer on the team
+    REFERRAL = "referral"  # a mutual connection who can refer
+    OTHER = "other"
+
+
+class ContactSource(str, Enum):
+    """How a contact was discovered. LinkedIn is reached ONLY by manual review the
+    user pastes back — never scraped — so a ``MANUAL`` contact is the norm."""
+
+    LISTING = "listing"  # named in the job listing itself
+    MANUAL = "manual"  # found via manual LinkedIn review and recorded by hand
+
+
+@dataclass(frozen=True)
+class ContactTarget:
+    """A *role worth contacting* for a job — a "who to look for", not a person.
+
+    The target list is generated deterministically from the canonical job (see
+    ``contacts.target_contacts``) and rendered as a manual checklist. ``priority``
+    is 1-based (1 = reach first). ``linkedin_search`` is plain text the user pastes
+    into LinkedIn's search box *by hand* — the tool never queries or scrapes
+    LinkedIn — and ``rationale`` explains why this target is worth the effort.
+    """
+
+    role: ContactRole
+    priority: int
+    label: str
+    rationale: str
+    linkedin_search: str
+
+
+@dataclass(frozen=True)
+class Contact:
+    """A real named person to (maybe) reach out to about a job.
+
+    Recorded by the user from a manual LinkedIn review (the checklist paste-back)
+    or named in the listing. ``email_domain`` is the company's *business* email
+    domain (e.g. "acme.com") used to infer a business email — never a personal
+    domain (see ``email_format``). Email guesses are deliberately NOT stored on the
+    contact: they are recomputed at display time so the always-honored
+    do-not-contact list is applied against its current state, never a stale snapshot.
+    """
+
+    name: str
+    company: str
+    role: ContactRole = ContactRole.OTHER
+    title: str | None = None
+    linkedin_url: str | None = None
+    email_domain: str | None = None
+    source: ContactSource = ContactSource.MANUAL
+    notes: str | None = None
+
+
+@dataclass(frozen=True)
+class EmailGuess:
+    """A confidence-scored *business* email constructed for a person at a domain.
+
+    ``pattern`` names the construction rule (e.g. "first.last", "flast");
+    ``confidence`` is 0-1; ``provenance`` records whether the confidence came from
+    the heuristic prior ("heuristic") or was sharpened by an email-format lookup
+    ("format-source"). The guess is always a business email — personal domains are
+    refused upstream — and is suppressed entirely when on the do-not-contact list.
+    """
+
+    email: str
+    pattern: str
+    confidence: float
+    provenance: str
+    domain: str
