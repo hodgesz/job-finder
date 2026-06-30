@@ -401,6 +401,26 @@ def test_find_ids_by_prefix(store: JobStore):
     assert store.find_ids("zzz") == []
 
 
+def test_find_ids_escapes_like_wildcards(store: JobStore):
+    # A fragment of "%" (or one containing "_") must be matched LITERALLY, not as a
+    # SQL LIKE wildcard — otherwise "%" would match the sole stored job and let
+    # `status` mutate it with no real prefix supplied. (Bugbot Medium, PR #29.)
+    store.save_match(_match(), now=NOW)  # id "acme|ai+vp|remote" (no % or _)
+    assert store.find_ids("%") == []  # wildcard treated as a literal char
+    assert store.find_ids("_") == []
+    # A literal "%"/"_" in a stored id is still matchable as itself.
+    weird = CanonicalJob(
+        company="A%B_C",
+        title="VP of AI",
+        normalized_title="vp of ai",
+        location="Remote",
+    )
+    store.save_match(_match(weird), now=NOW)
+    wid = job_key(weird)
+    assert "%" in wid or "_" in wid  # guard the fixture
+    assert store.find_ids(wid[:5]) == [wid]  # literal prefix incl. the metachar
+
+
 # --------------------------------------------------------------------------- #
 # Migration — opening an older store file.
 # --------------------------------------------------------------------------- #

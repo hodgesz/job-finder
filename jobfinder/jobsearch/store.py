@@ -151,6 +151,16 @@ def _dt_opt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _escape_like(fragment: str) -> str:
+    """Escape SQL LIKE metacharacters (``\\``, ``%``, ``_``) for a literal match.
+
+    Used by :meth:`JobStore.find_ids` so a user-supplied id fragment is matched
+    verbatim rather than as a wildcard pattern. The backslash escape char must be
+    escaped first so it doesn't double-escape the ``%``/``_`` we add after it.
+    """
+    return fragment.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # --------------------------------------------------------------------------- #
 # Dataclass (de)serialization for the JSON payload.
 #
@@ -453,11 +463,17 @@ class JobStore:
 
         The job_key is a composite string; this lets the ``status`` subcommand
         accept an unambiguous leading fragment instead of the whole quoted key.
+
+        The fragment is matched as a LITERAL prefix: ``%`` and ``_`` (SQL LIKE
+        wildcards) are escaped so a fragment like ``%`` or one containing ``_``
+        can't match rows it shouldn't (which, with a single stored job, would let
+        ``status`` mutate it despite no real prefix being supplied).
         """
+        pattern = _escape_like(prefix) + "%"
         with self.engine.connect() as conn:
             rows = conn.execute(
                 select(jobs_table.c.id)
-                .where(jobs_table.c.id.like(f"{prefix}%"))
+                .where(jobs_table.c.id.like(pattern, escape="\\"))
                 .order_by(jobs_table.c.id)
             ).all()
         return [r[0] for r in rows]
