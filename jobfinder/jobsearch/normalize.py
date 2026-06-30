@@ -174,6 +174,22 @@ def job_key(job: CanonicalJob) -> str:
     to the same hard key, else a stable hash of the raw fields — so two distinct
     under-parsed postings get distinct keys (no silent overwrite) just as the
     in-run dedupe keeps them as distinct rows.
+
+    Why soft-key FIRST (not hard-key first): the common cross-source case is the
+    SAME role seen via a LinkedIn alert one run and an ATS board the next — those
+    carry DIFFERENT hard ids/URLs (LinkedIn job id vs ATS req id), so only the soft
+    key matches them across runs; hard-first precedence would split that case into
+    two rows. The soft key is the right cross-run identity whenever company+title
+    parse.
+
+    Accepted limitation (single-user CRM; documented, not worked around): a role
+    first ingested UNDER-PARSED (keyed ``hard:``/``raw:``) and only LATER enriched
+    enough to compute a soft key transitions keys across runs, so the enriched run
+    inserts a NEW row and any status set on the old id stays on the old row. The
+    fallback path is rare (LinkedIn alerts and ATS boards almost always carry a
+    company + title), and the worst case is a duplicate row whose status is simply
+    re-set — not data loss — so a cross-run key-migration layer is deliberately not
+    worth its complexity here (same spirit as Slice A's accepted merge edges).
     """
     company = normalize_company(job.company)
     signature = "+".join(sorted(_title_signature(normalize_title(job.title))))
