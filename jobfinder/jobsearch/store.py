@@ -968,19 +968,43 @@ class JobStore:
             ).all()
         return [r[0] for r in rows]
 
-    def mark_sent(self, draft_id: str, *, now: datetime | None = None) -> bool:
-        """Flip a draft to SENT, stamping ``sent_at``. Returns True if a row changed.
+    def claim_for_send(self, draft_id: str, *, now: datetime | None = None) -> bool:
+        """Atomically claim a DRAFTED draft for sending: flip it to SENT.
 
-        Called by the CLI *after* the gmail.send seam confirms the send, so the
-        store records what actually went out. Returns False if the draft id no
-        longer exists, so the caller can report it rather than claim a false send.
+        Returns True only if THIS call transitioned a still-``DRAFTED`` row to
+        ``SENT`` (the ``status == DRAFTED`` guard is in the UPDATE's WHERE, so the
+        check-and-set is one atomic statement). Returns False if the draft is
+        missing or already SENT. The CLI calls this **before** the network send, so
+        the row leaves the sendable state the instant we commit to sending — a
+        second ``send --confirm`` can never re-enter the send path (at-most-once).
+        A genuinely-failed send is rolled back with :meth:`unmark_sent`.
         """
         now = now or _utcnow()
         with self.engine.begin() as conn:
             result = conn.execute(
                 drafts_table.update()
-                .where(drafts_table.c.id == draft_id)
+                .where(
+                    (drafts_table.c.id == draft_id)
+                    & (drafts_table.c.status == DraftStatus.DRAFTED.value)
+                )
                 .values(status=DraftStatus.SENT.value, sent_at=_iso(now))
+            )
+        return result.rowcount > 0
+
+    def unmark_sent(self, draft_id: str) -> bool:
+        """Revert a claimed draft back to DRAFTED (clearing ``sent_at``).
+
+        Used only when a claim_for_send succeeded but the actual send then FAILED,
+        so the user can legitimately retry. Returns True if a row changed. This is
+        the sole path back to DRAFTED after a claim, and it runs exclusively on the
+        send-failed branch — a *successful* send never reverts, so a delivered
+        email can't be resent.
+        """
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                drafts_table.update()
+                .where(drafts_table.c.id == draft_id)
+                .values(status=DraftStatus.DRAFTED.value, sent_at=None)
             )
         return result.rowcount > 0
 

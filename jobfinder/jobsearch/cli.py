@@ -695,11 +695,15 @@ def _run_outreach_draft(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if is_personal_domain(args.from_email):
-        # The sender's own address may legitimately be anything, but a personal
-        # FROM undercuts the business-outreach posture; keep it consistent.
+    # The sender's own From must be a well-formed BUSINESS address, using the SAME
+    # gate as the recipient — otherwise a malformed From ("@acme.com", "a@@acme.com")
+    # would be stored and used as the CAN-SPAM identity while the same shape is
+    # rejected for recipients (an inconsistency, and a broken/untruthful From).
+    if not is_valid_business_email(args.from_email):
         print(
-            "outreach draft: --from-email should be a business address.",
+            "outreach draft: --from-email must be a valid business address "
+            "(a truthful CAN-SPAM From; personal domains and malformed addresses "
+            "are refused).",
             file=sys.stderr,
         )
         return 2
@@ -876,6 +880,18 @@ def _run_outreach_send(args: argparse.Namespace) -> int:
         )
         return 2
     e = sd.email
+    # Claim the draft BEFORE the network call: atomically flip DRAFTED→SENT. This
+    # is the at-most-once guard — the row leaves the sendable state the instant we
+    # commit to sending, so even a concurrent/re-run `send --confirm` can't re-enter
+    # the send path (claim_for_send only succeeds from DRAFTED). If the claim fails,
+    # something already sent (or removed) it; refuse rather than double-send.
+    if not store.claim_for_send(sd.id):
+        print(
+            f"outreach send: draft {sd.id} is no longer sendable (already sent or "
+            "removed); refusing to re-send.",
+            file=sys.stderr,
+        )
+        return 2
     try:
         message_id = sender.send_email(
             to_email=e.to_email,
@@ -886,21 +902,11 @@ def _run_outreach_send(args: argparse.Namespace) -> int:
             body=render_email_text(e),
         )
     except GmailSendError as exc:
+        # The send genuinely failed → release the claim so the user can retry.
+        store.unmark_sent(sd.id)
         print(f"outreach send: {exc}", file=sys.stderr)
         return 2
     suffix = f" (message id {message_id})" if message_id else ""
-    # The email is out. Record it as SENT so the re-send guard engages next time.
-    # If the row vanished between get_draft and here, the send still happened —
-    # say so loudly rather than print a clean success that hides the drift (a
-    # DRAFTED-looking row would otherwise invite a duplicate send).
-    if not store.mark_sent(sd.id):
-        print(
-            f"outreach send: WARNING — sent to {e.to_email}{suffix}, but draft "
-            f"{sd.id} could not be marked sent (it may have been removed). Do NOT "
-            "re-send: the email was already delivered.",
-            file=sys.stderr,
-        )
-        return 1
     print(f"Sent draft {sd.id} to {e.to_email}{suffix}.")
     return 0
 

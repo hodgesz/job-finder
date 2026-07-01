@@ -1,9 +1,9 @@
 """Tests for the outreach-drafts persistence layer (Slice F).
 
 Hermetic: an in-memory SQLite store. Covers OutreachEmail round-trip fidelity,
-the stable (job, recipient) draft key (re-assembly updates in place), the
-DRAFTED→SENT transition via mark_sent, and that re-assembling resets a stale SENT
-draft back to DRAFTED (an edited draft is not yet sent).
+the stable (job, recipient) draft key (re-assembly updates in place), the atomic
+claim_for_send DRAFTED→SENT transition (at-most-once) with unmark_sent release,
+and that re-assembling an already-SENT recipient preserves the sent record.
 """
 
 import pytest
@@ -66,16 +66,35 @@ def test_reassembling_same_recipient_updates_in_place(store):
     assert drafts[0].email.subject == "v2"
 
 
-def test_mark_sent_flips_status_and_stamps(store):
+def test_claim_for_send_flips_status_and_stamps(store):
     sd = store.save_draft("job-1", _email())
-    assert store.mark_sent(sd.id) is True
+    assert store.claim_for_send(sd.id) is True
     got = store.get_draft(sd.id)
     assert got.status is DraftStatus.SENT
     assert got.sent_at is not None
 
 
-def test_mark_sent_on_missing_draft_returns_false(store):
-    assert store.mark_sent("d_nope") is False
+def test_claim_for_send_is_atomic_at_most_once(store):
+    # The claim only succeeds from DRAFTED, so a second claim (a re-run/concurrent
+    # send) fails — this is the structural double-send guard.
+    sd = store.save_draft("job-1", _email())
+    assert store.claim_for_send(sd.id) is True
+    assert store.claim_for_send(sd.id) is False  # already claimed → refuse
+
+
+def test_claim_for_send_on_missing_draft_returns_false(store):
+    assert store.claim_for_send("d_nope") is False
+
+
+def test_unmark_sent_releases_a_claim_for_retry(store):
+    # Only used when a claimed send FAILED: revert to DRAFTED so a retry can claim.
+    sd = store.save_draft("job-1", _email())
+    store.claim_for_send(sd.id)
+    assert store.unmark_sent(sd.id) is True
+    got = store.get_draft(sd.id)
+    assert got.status is DraftStatus.DRAFTED
+    assert got.sent_at is None
+    assert store.claim_for_send(sd.id) is True  # claimable again after release
 
 
 def test_reassembling_a_sent_draft_preserves_the_sent_record(store):
@@ -84,7 +103,7 @@ def test_reassembling_a_sent_draft_preserves_the_sent_record(store):
     # silently re-arm the send gate's already-sent guard, enabling a double-send.
     # save_draft returns the existing SENT record unchanged.
     sd = store.save_draft("job-1", _email(subject="v1"))
-    store.mark_sent(sd.id)
+    store.claim_for_send(sd.id)
     returned = store.save_draft("job-1", _email(subject="v2"))
     assert returned.status is DraftStatus.SENT  # signals "already sent" to the CLI
     got = store.get_draft(sd.id)
@@ -96,7 +115,7 @@ def test_reassembling_a_sent_draft_preserves_the_sent_record(store):
 def test_list_drafts_filters_by_status(store):
     sd1 = store.save_draft("job-1", _email(to_email="a@acme.com"))
     store.save_draft("job-2", _email(to_email="b@acme.com"))
-    store.mark_sent(sd1.id)
+    store.claim_for_send(sd1.id)
     assert len(store.list_drafts(status=DraftStatus.SENT)) == 1
     assert len(store.list_drafts(status=DraftStatus.DRAFTED)) == 1
     assert len(store.list_drafts()) == 2

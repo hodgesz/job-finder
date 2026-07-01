@@ -89,6 +89,32 @@ def test_draft_requires_sender_identity(seeded_db, capsys):
         )
 
 
+def test_draft_refuses_malformed_from_email(seeded_db, capsys):
+    # The sender's own From must pass the SAME business-email gate as recipients —
+    # a malformed From ("@acme.com") must not become the stored CAN-SPAM identity.
+    db, key = seeded_db
+    rc = main(
+        [
+            "outreach",
+            "draft",
+            "--db",
+            str(db),
+            key,
+            "Jane",
+            "--to-email",
+            "jane.smith@acme.com",
+            "--from-name",
+            "Jon",
+            "--from-email",
+            "@acme.com",
+        ]
+    )
+    assert rc == 2
+    assert "from-email must be a valid business address" in capsys.readouterr().err
+    # Nothing was drafted.
+    assert JobStore(f"sqlite+pysqlite:///{db}").list_drafts() == []
+
+
 def test_draft_refuses_personal_recipient_domain(seeded_db, capsys):
     db, key = seeded_db
     rc = main(
@@ -243,21 +269,26 @@ def test_dry_run_still_shows_a_suppressed_draft_with_a_note(
     assert fake_sender.sent == []
 
 
-def test_send_warns_when_mark_sent_fails_after_delivery(
-    seeded_db, capsys, fake_sender, monkeypatch
+def test_send_claims_draft_before_sending_so_a_failed_send_can_retry(
+    seeded_db, capsys, monkeypatch
 ):
-    # If the row can't be marked SENT after a successful delivery, the CLI must
-    # warn loudly (rc 1) rather than print a clean success that invites a re-send.
+    # A genuinely failed send releases the claim (draft back to DRAFTED) so the
+    # user can retry — the row is not stuck SENT after a non-delivery.
     db, key = seeded_db
     _draft(db, key, capsys)
     did = JobStore(f"sqlite+pysqlite:///{db}").list_drafts()[0].id
-    monkeypatch.setattr(cli.JobStore, "mark_sent", lambda self, draft_id: False)
+
+    class _FailingSender:
+        def send_email(self, **kwargs):
+            raise cli.GmailSendError("api down")
+
+    monkeypatch.setattr(
+        cli.GmailSender, "from_env", classmethod(lambda cls: _FailingSender())
+    )
     rc = main(["outreach", "send", "--db", str(db), did, "--confirm"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "WARNING" in err
-    assert "already delivered" in err.lower()
-    assert len(fake_sender.sent) == 1  # it DID send
+    assert rc == 2
+    # Released back to DRAFTED for a retry (not stuck SENT after a non-delivery).
+    assert JobStore(f"sqlite+pysqlite:///{db}").get_draft(did).status.value == "drafted"
 
 
 # --------------------------------------------------------------------------- #
