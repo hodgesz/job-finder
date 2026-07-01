@@ -880,6 +880,9 @@ def _run_outreach_send(args: argparse.Namespace) -> int:
         )
         return 2
     e = sd.email
+    # Render the body BEFORE claiming, so a rendering failure can't strand a
+    # claimed (SENT-marked) draft that never went out.
+    body = render_email_text(e)
     # Claim the draft BEFORE the network call: atomically flip DRAFTED→SENT. This
     # is the at-most-once guard — the row leaves the sendable state the instant we
     # commit to sending, so even a concurrent/re-run `send --confirm` can't re-enter
@@ -899,13 +902,20 @@ def _run_outreach_send(args: argparse.Namespace) -> int:
             from_email=e.from_email,
             from_name=e.from_name,
             subject=e.subject,
-            body=render_email_text(e),
+            body=body,
         )
-    except GmailSendError as exc:
-        # The send genuinely failed → release the claim so the user can retry.
+    except Exception as exc:
+        # ANY failure during the send (a GmailSendError, or any unexpected error)
+        # means the email did not go out → release the claim so the draft returns
+        # to DRAFTED and the user can retry. Catching only GmailSendError would
+        # leave the draft stuck SENT (undeliverable, and refused as already-sent)
+        # on any other error. Re-raise a non-send error after releasing so it isn't
+        # silently swallowed; a clean GmailSendError is reported as rc 2.
         store.unmark_sent(sd.id)
-        print(f"outreach send: {exc}", file=sys.stderr)
-        return 2
+        if isinstance(exc, GmailSendError):
+            print(f"outreach send: {exc}", file=sys.stderr)
+            return 2
+        raise
     suffix = f" (message id {message_id})" if message_id else ""
     print(f"Sent draft {sd.id} to {e.to_email}{suffix}.")
     return 0

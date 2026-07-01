@@ -291,6 +291,30 @@ def test_send_claims_draft_before_sending_so_a_failed_send_can_retry(
     assert JobStore(f"sqlite+pysqlite:///{db}").get_draft(did).status.value == "drafted"
 
 
+def test_unexpected_send_error_releases_claim_not_stuck_sent(
+    seeded_db, capsys, monkeypatch
+):
+    # A NON-GmailSendError failure during the send (e.g. an unexpected bug) must
+    # still release the claim so the draft isn't stranded SENT-but-undelivered —
+    # otherwise later sends would be refused as "already sent" for an email that
+    # never went out. The error is re-raised (not swallowed).
+    db, key = seeded_db
+    _draft(db, key, capsys)
+    did = JobStore(f"sqlite+pysqlite:///{db}").list_drafts()[0].id
+
+    class _BuggySender:
+        def send_email(self, **kwargs):
+            raise ValueError("unexpected boom")
+
+    monkeypatch.setattr(
+        cli.GmailSender, "from_env", classmethod(lambda cls: _BuggySender())
+    )
+    with pytest.raises(ValueError):
+        main(["outreach", "send", "--db", str(db), did, "--confirm"])
+    # The claim was released despite the unexpected error type.
+    assert JobStore(f"sqlite+pysqlite:///{db}").get_draft(did).status.value == "drafted"
+
+
 # --------------------------------------------------------------------------- #
 # list-drafts.
 # --------------------------------------------------------------------------- #
