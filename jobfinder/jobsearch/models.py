@@ -235,6 +235,55 @@ class Contact:
     notes: str | None = None
 
 
+class DraftStatus(str, Enum):
+    """Where an assembled outreach email sits in the draft-and-approve flow (Slice F).
+
+    An email is born ``DRAFTED`` when assembled — that is the *only* state in
+    which it has not left the machine. It moves to ``SENT`` solely through the
+    explicit, separate ``outreach send <id> --confirm`` step; nothing else
+    advances it. There is no autonomous send: the gate between these two states
+    IS the feature. ``str`` mixin so it serialises/compares as its value.
+    """
+
+    DRAFTED = "drafted"  # assembled + stored; nothing sent
+    SENT = "sent"  # explicitly approved and sent via the gmail.send seam
+
+
+@dataclass(frozen=True)
+class OutreachEmail:
+    """A tailored outreach email assembled for a contact about a job (Slice F).
+
+    Assembled deterministically from data the tool already has (the
+    ``CanonicalJob``, the ``Contact`` + role, the persona/match reason), optionally
+    sharpened by an injected LLM tailoring seam. It is a *draft* — assembling one
+    sends nothing. The two-step ``outreach send <id> --confirm`` gate is the only
+    path that puts it on the wire.
+
+    CAN-SPAM-style hygiene is structural, not decorative: ``from_name`` /
+    ``from_email`` are the sender's real identity (a truthful "From"), ``subject``
+    is a truthful, non-deceptive summary, and ``opt_out`` is a plain way for the
+    recipient to ask not to be contacted again (the user records that back via
+    ``dnc``). ``to_email`` is always a *business* address (personal domains are
+    refused upstream) that is NOT on the do-not-contact list at assembly time —
+    and the send gate re-checks it (defence in depth).
+
+    ``tailoring`` records how the body was produced ("template" or
+    "llm+template") so the output is explainable, mirroring how ``LlmRerank``
+    surfaces the LLM's contribution rather than hiding it.
+    """
+
+    to_email: str
+    to_name: str
+    subject: str
+    body: str
+    from_name: str
+    from_email: str
+    company: str
+    job_title: str
+    opt_out: str
+    tailoring: str = "template"
+
+
 @dataclass(frozen=True)
 class EmailGuess:
     """A confidence-scored *business* email constructed for a person at a domain.

@@ -29,6 +29,7 @@ from jobfinder.jobsearch.contacts import render_checklist, target_contacts
 from jobfinder.jobsearch.email_format import (
     guess_emails,
     is_personal_domain,
+    is_valid_business_email,
     normalize_domain,
 )
 from jobfinder.jobsearch.match import rank_jobs
@@ -37,12 +38,19 @@ from jobfinder.jobsearch.models import (
     Contact,
     ContactRole,
     ContactSource,
+    DraftStatus,
     EmailGuess,
     JobMatch,
     RawPosting,
     Tier,
 )
 from jobfinder.jobsearch.normalize import canonicalize, job_key
+from jobfinder.jobsearch.outreach import (
+    GeminiTailorer,
+    SenderIdentity,
+    assemble_email,
+    render_email_text,
+)
 from jobfinder.jobsearch.profile import LIVE_DIMENSIONS, VP_AI_PROFILE
 from jobfinder.jobsearch.rerank import (
     DEFAULT_RERANK_TOP,
@@ -55,7 +63,12 @@ from jobfinder.jobsearch.sources.gmail import (
     DEFAULT_CRED_DIR,
     GmailSource,
 )
-from jobfinder.jobsearch.store import JobStore, StoredContact, StoredJob
+from jobfinder.jobsearch.sources.gmail_send import (
+    SEND_TOKEN_FILENAME,
+    GmailSendError,
+    GmailSender,
+)
+from jobfinder.jobsearch.store import JobStore, StoredContact, StoredDraft, StoredJob
 from jobfinder.sources.ats import PROVIDERS, AtsClient, JobBoard
 
 _TIER_ORDER = {Tier.A: 0, Tier.B: 1, Tier.C: 2}
@@ -293,30 +306,37 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_job_id(store: JobStore, fragment: str, *, cmd: str) -> str | None:
-    """Resolve an unambiguous leading id fragment to a full job_key, or None.
+def _resolve_id(
+    fragment: str,
+    finder,
+    *,
+    cmd: str,
+    noun: str,
+    see: str,
+) -> str | None:
+    """Resolve an unambiguous leading id fragment to a full id, or None.
 
     Prints a clear error to stderr (and returns None) when the fragment is empty,
-    matches nothing, or is ambiguous — so the caller just returns rc 2. Shared by
-    every subcommand that takes a JOB_ID (status/contacts/add-contact) so the
-    resolution rules can't drift between them. (`email` takes name+domain, not a
-    job id, so it does not use this.)
+    matches nothing, or is ambiguous — so the caller just returns rc 2. ``finder``
+    is the store lookup (``find_ids`` for jobs, ``find_draft_ids`` for drafts);
+    ``noun`` and ``see`` tailor the messages. Sharing this keeps the resolution
+    rules (incl. the empty-fragment guard) identical across every subcommand.
     """
     # An empty fragment would "match" every row via the prefix scan; require a real
     # fragment so e.g. `status --db x '' applied` can't silently hit the sole row.
     if not fragment:
         print(
-            f"{cmd}: provide a job id (or a leading fragment); see `list`.",
+            f"{cmd}: provide a {noun} id (or a leading fragment); see `{see}`.",
             file=sys.stderr,
         )
         return None
-    matches = store.find_ids(fragment)
+    matches = finder(fragment)
     if not matches:
-        print(f"{cmd}: no job id starting with {fragment!r}.", file=sys.stderr)
+        print(f"{cmd}: no {noun} id starting with {fragment!r}.", file=sys.stderr)
         return None
     if len(matches) > 1:
         print(
-            f"{cmd}: {fragment!r} is ambiguous ({len(matches)} jobs); "
+            f"{cmd}: {fragment!r} is ambiguous ({len(matches)} {noun}s); "
             "use a longer id fragment:",
             file=sys.stderr,
         )
@@ -324,6 +344,16 @@ def _resolve_job_id(store: JobStore, fragment: str, *, cmd: str) -> str | None:
             print(f"  {mid}", file=sys.stderr)
         return None
     return matches[0]
+
+
+def _resolve_job_id(store: JobStore, fragment: str, *, cmd: str) -> str | None:
+    """Resolve a leading job-id fragment to a full job_key (see :func:`_resolve_id`).
+
+    Shared by every subcommand that takes a JOB_ID (status/contacts/add-contact/
+    outreach draft). (`email` takes name+domain, not a job id, so it does not use
+    this.)
+    """
+    return _resolve_id(fragment, store.find_ids, cmd=cmd, noun="job", see="list")
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -558,6 +588,339 @@ def _run_dnc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_draft_id(store: JobStore, fragment: str, *, cmd: str) -> str | None:
+    """Resolve a leading draft-id fragment to a full id (see :func:`_resolve_id`)."""
+    return _resolve_id(
+        fragment,
+        store.find_draft_ids,
+        cmd=cmd,
+        noun="draft",
+        see="outreach list-drafts",
+    )
+
+
+def _resolve_recipient(args, store: JobStore, *, cmd: str) -> str | None:
+    """Resolve the outreach recipient: an explicit --to-email or a top email guess.
+
+    Both paths enforce the same two structural guards: the address must be a
+    BUSINESS domain (personal domains refused) and must NOT be on the
+    do-not-contact list. An explicit ``--to-email`` is validated directly; without
+    one, the top confidence-ranked business guess from ``guess_emails`` (which
+    already applies the do-not-contact filter at the producer) is used. Returns
+    ``None`` (after printing why) when no honest, permitted address is available.
+    """
+    if args.to_email:
+        addr = args.to_email.strip()
+        # Fail closed on malformed/personal addresses: is_valid_business_email
+        # rejects the "@acme.com"/"a@@acme.com" shapes a domain-only check would
+        # pass, and any personal/free-mail domain (business emails only).
+        if not is_valid_business_email(addr):
+            print(
+                f"{cmd}: {addr!r} is not a valid business email (business domains "
+                "only; personal domains refused).",
+                file=sys.stderr,
+            )
+            return None
+        if store.is_suppressed(addr):
+            print(
+                f"{cmd}: {addr!r} is on the do-not-contact list — refusing.",
+                file=sys.stderr,
+            )
+            return None
+        return addr
+    if not args.domain:
+        print(
+            f"{cmd}: provide a recipient with --to-email, or --domain to guess one.",
+            file=sys.stderr,
+        )
+        return None
+    if is_personal_domain(args.domain):
+        print(
+            f"{cmd}: {args.domain!r} is a personal email domain; business emails only.",
+            file=sys.stderr,
+        )
+        return None
+    guesses = guess_emails(args.name, args.domain, is_suppressed=store.is_suppressed)
+    if guesses:
+        return guesses[0].email
+    # Nothing usable: distinguish "all suppressed" from "couldn't construct".
+    if guess_emails(args.name, args.domain):
+        print(
+            f"{cmd}: every business-email guess for {args.name!r} @ {args.domain!r} "
+            "is on the do-not-contact list — refusing.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"{cmd}: could not construct a business email for {args.name!r} @ "
+            f"{args.domain!r} (need a full name and a valid business domain), and "
+            "no --to-email was given.",
+            file=sys.stderr,
+        )
+    return None
+
+
+def render_draft(sd: StoredDraft, *, full: bool = False) -> str:
+    """Render a stored draft for review. With ``full``, include the body text."""
+    e = sd.email
+    lines = [
+        f"Draft {sd.id}  [{sd.status.value}]",
+        f"   To:      {e.to_name} <{e.to_email}>",
+        f"   From:    {e.from_name} <{e.from_email}>",
+        f"   Subject: {e.subject}",
+        f"   Role:    {e.job_title} @ {e.company}",
+        f"   Tailoring: {e.tailoring}",
+    ]
+    if sd.sent_at is not None:
+        lines.append(f"   Sent at: {sd.sent_at.isoformat()}")
+    if full:
+        lines.append("   ----- email text -----")
+        for line in render_email_text(e).splitlines():
+            lines.append(f"   {line}")
+        lines.append("   ----------------------")
+    return "\n".join(lines)
+
+
+def _run_outreach_draft(args: argparse.Namespace) -> int:
+    """Assemble a tailored outreach draft for a job + recipient. Sends NOTHING.
+
+    The draft is stored DRAFTED; reviewing it and sending are separate steps. The
+    recipient is always a permitted business address; the body is the deterministic
+    template, optionally sharpened by the injected LLM seam (--tailor).
+    """
+    if not args.from_name.strip() or not args.from_email.strip():
+        print(
+            "outreach draft: --from-name and --from-email are required (a truthful "
+            "sender identity).",
+            file=sys.stderr,
+        )
+        return 2
+    # The sender's own From must be a well-formed BUSINESS address, using the SAME
+    # gate as the recipient — otherwise a malformed From ("@acme.com", "a@@acme.com")
+    # would be stored and used as the CAN-SPAM identity while the same shape is
+    # rejected for recipients (an inconsistency, and a broken/untruthful From).
+    if not is_valid_business_email(args.from_email):
+        print(
+            "outreach draft: --from-email must be a valid business address "
+            "(a truthful CAN-SPAM From; personal domains and malformed addresses "
+            "are refused).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"outreach draft: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    job_id = _resolve_job_id(store, args.job_id, cmd="outreach draft")
+    if job_id is None:
+        return 2
+    stored_job = store.get(job_id)
+    if stored_job is None:
+        print(f"outreach draft: job {job_id!r} no longer exists.", file=sys.stderr)
+        return 2
+    if not args.name.strip():
+        print("outreach draft: a contact name is required.", file=sys.stderr)
+        return 2
+    to_email = _resolve_recipient(args, store, cmd="outreach draft")
+    if to_email is None:
+        return 2
+
+    job = stored_job.match.job
+    contact = Contact(
+        name=args.name.strip(),
+        company=job.company,
+        role=ContactRole(args.role),
+        email_domain=normalize_domain(args.domain) if args.domain else None,
+        source=ContactSource.MANUAL,
+    )
+    # Tailoring seam: built lazily and only when --tailor is set AND a key exists.
+    # With no key the tailorer is None and assemble_email uses the deterministic
+    # template — a run without --tailor (or without a key) is pure template.
+    tailorer = None
+    if args.tailor:
+        tailorer = GeminiTailorer.from_env(match_reason=stored_job.match.reason)
+        if tailorer is None:
+            print(
+                "outreach draft: --tailor needs GEMINI_API_KEY set; "
+                "using the deterministic template body.",
+                file=sys.stderr,
+            )
+    email = assemble_email(
+        job,
+        contact,
+        to_email,
+        sender=SenderIdentity(
+            name=args.from_name.strip(), email=args.from_email.strip()
+        ),
+        match_reason=stored_job.match.reason,
+        tailorer=tailorer,
+    )
+    if email is None:
+        print(
+            f"outreach draft: could not assemble a draft for {to_email!r} "
+            "(unusable or personal recipient domain).",
+            file=sys.stderr,
+        )
+        return 2
+    sd = store.save_draft(job_id, email)
+    # save_draft refuses to overwrite an already-SENT draft (so the "already
+    # contacted" record and the re-send guard survive). Detect that and warn
+    # rather than falsely claiming a fresh draft was written.
+    if sd.status is DraftStatus.SENT:
+        print(
+            f"outreach draft: {to_email} was already emailed for this job "
+            f"({sd.sent_at.isoformat() if sd.sent_at else 'unknown time'}); "
+            "keeping the sent record (nothing re-drafted).",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"Drafted (nothing sent). Review, then `outreach send {sd.id} --confirm`.")
+    print(render_draft(sd, full=True))
+    return 0
+
+
+def _run_outreach_list(args: argparse.Namespace) -> int:
+    """List assembled outreach drafts (newest first), optionally by status."""
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"outreach list-drafts: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    status = DraftStatus(args.status) if args.status else None
+    drafts = store.list_drafts(status=status)
+    header = f"{len(drafts)} outreach draft(s)"
+    print(header)
+    print("=" * len(header))
+    if not drafts:
+        print("\nNo drafts. Assemble one with `outreach draft <job> <name> ...`.")
+        return 0
+    for sd in drafts:
+        print("")
+        print(render_draft(sd))
+    return 0
+
+
+def _run_outreach_send(args: argparse.Namespace) -> int:
+    """The draft-and-approve SEND gate — the only path that can put mail on the wire.
+
+    Without ``--confirm`` this is a DRY RUN: it prints exactly what WOULD be sent
+    and sends nothing. ``--confirm`` is the explicit, separate, deliberate approval
+    that actually sends via the gmail.send seam. Even with ``--confirm`` the
+    do-not-contact list and business-only rule are RE-CHECKED here (defence in
+    depth — never trust that the draft layer already filtered, since a draft can be
+    stale relative to a later `dnc` entry), and an already-sent draft is not
+    re-sent.
+    """
+    try:
+        store = _open_store(args.db)
+    except SQLAlchemyError as exc:
+        print(f"outreach send: could not open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    draft_id = _resolve_draft_id(store, args.draft_id, cmd="outreach send")
+    if draft_id is None:
+        return 2
+    sd = store.get_draft(draft_id)
+    if sd is None:
+        print(f"outreach send: draft {draft_id!r} no longer exists.", file=sys.stderr)
+        return 2
+    if sd.status is DraftStatus.SENT:
+        print(
+            f"outreach send: draft {sd.id} was already sent "
+            f"({sd.sent_at.isoformat() if sd.sent_at else 'unknown time'}); "
+            "refusing to re-send.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Defence in depth: re-check the recipient at send time, NOT trusting that the
+    # draft was filtered when assembled. A `dnc` entry (or a bad address) added
+    # after the draft was written must still block the SEND. Computed for both
+    # paths: the dry run surfaces it (so a stale draft can still be reviewed and
+    # the reason seen), and the real send refuses on it.
+    to_email = sd.email.to_email
+    blocked: str | None = None
+    if is_personal_domain(to_email):
+        blocked = f"{to_email!r} is a personal domain; business emails only"
+    elif not is_valid_business_email(to_email):
+        blocked = f"{to_email!r} is not a valid business email"
+    elif store.is_suppressed(to_email):
+        blocked = f"{to_email!r} is on the do-not-contact list"
+
+    if not args.confirm:
+        # DRY RUN — the safe default. Show what WOULD be sent; send nothing. A
+        # blocked recipient is still shown (for review) with why it can't be sent.
+        print("DRY RUN — nothing sent. Re-run with --confirm to actually send.")
+        if blocked is not None:
+            print(f"NOTE: this draft cannot be sent — {blocked}.")
+        print(render_draft(sd, full=True))
+        return 0
+
+    if blocked is not None:
+        print(
+            f"outreach send: {blocked} — refusing to send (even though a draft "
+            "exists for it).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Explicit approval given: send via the injected gmail.send seam.
+    try:
+        sender = GmailSender.from_env()
+    except GmailSendError as exc:
+        print(f"outreach send: {exc}", file=sys.stderr)
+        return 2
+    if sender is None:
+        print(
+            "outreach send: --confirm needs Gmail send credentials on disk: place "
+            f"{CLIENT_SECRET_FILENAME} under {DEFAULT_CRED_DIR} and authorize the "
+            f"send scope once (writes {SEND_TOKEN_FILENAME}). See "
+            "jobfinder/jobsearch/sources/gmail_send.py.",
+            file=sys.stderr,
+        )
+        return 2
+    e = sd.email
+    # Render the body BEFORE claiming, so a rendering failure can't strand a
+    # claimed (SENT-marked) draft that never went out.
+    body = render_email_text(e)
+    # Claim the draft BEFORE the network call: atomically flip DRAFTED→SENT. This
+    # is the at-most-once guard — the row leaves the sendable state the instant we
+    # commit to sending, so even a concurrent/re-run `send --confirm` can't re-enter
+    # the send path (claim_for_send only succeeds from DRAFTED). If the claim fails,
+    # something already sent (or removed) it; refuse rather than double-send.
+    if not store.claim_for_send(sd.id):
+        print(
+            f"outreach send: draft {sd.id} is no longer sendable (already sent or "
+            "removed); refusing to re-send.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        message_id = sender.send_email(
+            to_email=e.to_email,
+            to_name=e.to_name,
+            from_email=e.from_email,
+            from_name=e.from_name,
+            subject=e.subject,
+            body=body,
+        )
+    except Exception as exc:
+        # ANY failure during the send (a GmailSendError, or any unexpected error)
+        # means the email did not go out → release the claim so the draft returns
+        # to DRAFTED and the user can retry. Catching only GmailSendError would
+        # leave the draft stuck SENT (undeliverable, and refused as already-sent)
+        # on any other error. Re-raise a non-send error after releasing so it isn't
+        # silently swallowed; a clean GmailSendError is reported as rc 2.
+        store.unmark_sent(sd.id)
+        if isinstance(exc, GmailSendError):
+            print(f"outreach send: {exc}", file=sys.stderr)
+            return 2
+        raise
+    suffix = f" (message id {message_id})" if message_id else ""
+    print(f"Sent draft {sd.id} to {e.to_email}{suffix}.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jobfinder.jobsearch",
@@ -771,6 +1134,105 @@ def build_parser() -> argparse.ArgumentParser:
     dnc_p.add_argument(
         "--reason", default=None, help="Why this entry is suppressed (optional)."
     )
+
+    # ----- outreach (Slice F): draft-and-approve, human-in-the-loop ----- #
+    outreach_p = sub.add_parser(
+        "outreach",
+        help="Draft-and-approve outreach: assemble a tailored email for a contact, "
+        "review it, and send it only via an explicit, separate confirm step. Never "
+        "sends autonomously.",
+    )
+    outreach_sub = outreach_p.add_subparsers(dest="outreach_command", required=True)
+
+    draft_p = outreach_sub.add_parser(
+        "draft",
+        help="Assemble a tailored outreach draft for a saved job + a contact. "
+        "Stores the draft and sends NOTHING.",
+    )
+    draft_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database (jobs + DNC)."
+    )
+    draft_p.add_argument(
+        "job_id",
+        metavar="JOB_ID",
+        help="The job this outreach is about (id or unambiguous fragment) — see `list`.",
+    )
+    draft_p.add_argument("name", metavar="NAME", help="The recipient's full name.")
+    draft_p.add_argument(
+        "--to-email",
+        default=None,
+        metavar="EMAIL",
+        help="The exact business address to write to. If omitted, the top "
+        "confidence-ranked business guess for NAME at --domain is used (the "
+        "do-not-contact list is always honored). Personal domains are refused.",
+    )
+    draft_p.add_argument(
+        "--domain",
+        default=None,
+        metavar="DOMAIN",
+        help="The company's BUSINESS email domain, used to guess --to-email when "
+        "it isn't given (e.g. 'acme.com'). Personal domains are rejected.",
+    )
+    draft_p.add_argument(
+        "--role",
+        choices=[r.value for r in ContactRole],
+        default=ContactRole.OTHER.value,
+        help="How the recipient relates to the role (tailors the body; default other).",
+    )
+    draft_p.add_argument(
+        "--from-name",
+        required=True,
+        metavar="NAME",
+        help="YOUR real name (a truthful CAN-SPAM 'From').",
+    )
+    draft_p.add_argument(
+        "--from-email",
+        required=True,
+        metavar="EMAIL",
+        help="YOUR real reply-to address (where an opt-out reply lands).",
+    )
+    draft_p.add_argument(
+        "--tailor",
+        action="store_true",
+        help="Opt-in: sharpen the body with the Gemini tailoring seam (needs "
+        "GEMINI_API_KEY). Degrades to the deterministic template without a key or "
+        "on any LLM error; the subject, identity and opt-out stay deterministic.",
+    )
+
+    list_drafts_p = outreach_sub.add_parser(
+        "list-drafts", help="List assembled outreach drafts, newest first."
+    )
+    list_drafts_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database to read."
+    )
+    list_drafts_p.add_argument(
+        "--status",
+        choices=[s.value for s in DraftStatus],
+        default=None,
+        help="Show only drafts in this state (drafted | sent).",
+    )
+
+    send_p = outreach_sub.add_parser(
+        "send",
+        help="Review a draft (dry run) or, with --confirm, actually send it. This "
+        "is the ONLY path that puts mail on the wire; the do-not-contact list is "
+        "re-checked at send time.",
+    )
+    send_p.add_argument(
+        "--db", required=True, metavar="PATH", help="The CRM database (drafts + DNC)."
+    )
+    send_p.add_argument(
+        "draft_id",
+        metavar="DRAFT_ID",
+        help="The draft to send (id or unambiguous fragment) — see `outreach "
+        "list-drafts`.",
+    )
+    send_p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Explicitly approve and SEND this draft via Gmail (gmail.send scope). "
+        "Without it, this is a DRY RUN that prints the email and sends nothing.",
+    )
     return parser
 
 
@@ -790,6 +1252,13 @@ def main(argv: list[str] | None = None) -> int:
         return _run_email(args)
     if args.command == "dnc":
         return _run_dnc(args)
+    if args.command == "outreach":
+        if args.outreach_command == "draft":
+            return _run_outreach_draft(args)
+        if args.outreach_command == "list-drafts":
+            return _run_outreach_list(args)
+        if args.outreach_command == "send":
+            return _run_outreach_send(args)
     return 2  # pragma: no cover - argparse enforces a valid command
 
 

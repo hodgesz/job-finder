@@ -10,6 +10,7 @@ from jobfinder.jobsearch.email_format import (
     domain_matches,
     guess_emails,
     is_personal_domain,
+    is_valid_business_email,
     normalize_domain,
     split_name,
 )
@@ -88,6 +89,28 @@ def test_personal_domain_guard_covers_subdomains():
     # Regression: a sub-domain of a free-mail provider must still count personal.
     assert is_personal_domain("mail.gmail.com")
     assert guess_emails("Jane Smith", "mail.gmail.com") == []
+
+
+def test_is_valid_business_email_accepts_well_formed_business_addresses():
+    assert is_valid_business_email("jane.smith@acme.com")
+    assert is_valid_business_email("jane@careers.acme.co.uk")
+    assert is_valid_business_email("  Jane@Acme.com  ")  # stripped/normalized
+
+
+def test_is_valid_business_email_rejects_malformed_and_personal():
+    # The shapes a domain-only check (normalize_domain) would wrongly accept:
+    assert not is_valid_business_email("@acme.com")  # empty local part
+    assert not is_valid_business_email("a@@acme.com")  # multiple @
+    assert not is_valid_business_email("a@b@acme.com")
+    assert not is_valid_business_email("jane doe@acme.com")  # whitespace in local
+    # And the ordinary rejects:
+    assert not is_valid_business_email("not-an-email")  # no @
+    assert not is_valid_business_email("jane@")  # no domain
+    assert not is_valid_business_email("jane@localhost")  # unresolvable domain
+    assert not is_valid_business_email("jane@gmail.com")  # personal
+    assert not is_valid_business_email("jane@mail.gmail.com")  # personal subdomain
+    assert not is_valid_business_email("")
+    assert not is_valid_business_email(None)
 
 
 def test_domain_matches_walks_parents():

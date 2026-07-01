@@ -169,6 +169,33 @@ def is_personal_domain(domain: str | None) -> bool:
     return norm is not None and domain_matches(norm, PERSONAL_EMAIL_DOMAINS)
 
 
+# A local part is required and must not itself contain "@" or whitespace. This is
+# intentionally permissive on the local-part character set (real mailboxes vary
+# widely) but rejects the empty/multi-"@"/whitespace shapes that would otherwise
+# slip past a domain-only check (e.g. "@acme.com", "a@@acme.com", "a b@acme.com").
+_LOCAL_PART_RE = re.compile(r"^[^@\s]+$")
+
+
+def is_valid_business_email(address: str | None) -> bool:
+    """True if ``address`` is a well-formed email at a non-personal business domain.
+
+    The single honest-recipient gate every outreach path should use: it rejects a
+    missing/blank address, anything without exactly one ``@`` and a non-empty local
+    part, a malformed/unresolvable domain, and any personal/free-mail domain. A
+    domain-only check (``normalize_domain(addr) is not None``) is NOT sufficient —
+    ``normalize_domain`` strips the local part, so it happily resolves a domain out
+    of ``"@acme.com"`` or ``"a@@acme.com"``; those must still be refused here."""
+    if not address:
+        return False
+    local, sep, domain = address.strip().partition("@")
+    if not sep or "@" in domain:  # zero or multiple "@"
+        return False
+    if not _LOCAL_PART_RE.match(local):
+        return False
+    norm = normalize_domain(domain)
+    return norm is not None and not domain_matches(norm, PERSONAL_EMAIL_DOMAINS)
+
+
 def split_name(name: str) -> tuple[str, str] | None:
     """Split a full name into (first, last) ASCII local-part tokens.
 

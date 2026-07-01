@@ -26,6 +26,7 @@ that restores tz-aware datetimes, the ``Source``/``Tier`` enums, and the nested
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -51,8 +52,10 @@ from jobfinder.jobsearch.models import (
     ContactRole,
     ContactSource,
     DimensionScore,
+    DraftStatus,
     JobMatch,
     LlmRerank,
+    OutreachEmail,
     RawPosting,
     Source,
     Tier,
@@ -126,6 +129,28 @@ do_not_contact_table = Table(
     Column("added_at", String, nullable=False),
 )
 
+# Assembled outreach drafts (Slice F) — the draft-and-approve store. A draft is
+# the assembled email (subject + body + truthful sender identity + opt-out) for a
+# job + recipient; it is born ``DRAFTED`` (nothing sent) and only the explicit
+# ``outreach send <id> --confirm`` path flips it to ``SENT``. Decoupled from the
+# ``jobs``/``contacts`` tables (NOT entangled): a draft references a job by its
+# stable ``job_id`` but stands alone. The primary key ``id`` is a stable
+# :func:`draft_key` over (job_id, recipient) so re-assembling the same outreach
+# updates in place rather than piling up duplicates. ``sent_at`` is NULL until
+# the draft is sent. The full ``OutreachEmail`` round-trips through ``payload``.
+drafts_table = Table(
+    "drafts",
+    _metadata,
+    Column("id", String, primary_key=True),  # stable draft_key(job_id, to_email)
+    Column("job_id", String, nullable=False, index=True),
+    Column("to_email", String, nullable=False, index=True),
+    Column("status", String, nullable=False, index=True),  # drafted | sent
+    Column("subject", String, nullable=False),
+    Column("created_at", String, nullable=False),
+    Column("sent_at", String, nullable=True),
+    Column("payload", JSON, nullable=False),
+)
+
 
 @dataclass(frozen=True)
 class StoredContact:
@@ -143,6 +168,23 @@ class DoNotContactEntry:
     value: str
     kind: str  # "email" | "domain"
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredDraft:
+    """A persisted outreach draft plus its draft-and-approve bookkeeping.
+
+    ``email`` is the full assembled ``OutreachEmail``; ``status`` is DRAFTED until
+    the explicit send step flips it to SENT (stamping ``sent_at``). ``id`` is the
+    stable :func:`draft_key`, used by the CLI to reference a draft for send.
+    """
+
+    id: str
+    job_id: str
+    email: OutreachEmail
+    status: DraftStatus
+    created_at: datetime
+    sent_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -365,6 +407,55 @@ def _contact_from_payload(d: dict) -> Contact:
         source=ContactSource(d.get("source", ContactSource.MANUAL.value)),
         notes=d.get("notes"),
     )
+
+
+def _email_to_payload(email: OutreachEmail) -> dict:
+    return {
+        "to_email": email.to_email,
+        "to_name": email.to_name,
+        "subject": email.subject,
+        "body": email.body,
+        "from_name": email.from_name,
+        "from_email": email.from_email,
+        "company": email.company,
+        "job_title": email.job_title,
+        "opt_out": email.opt_out,
+        "tailoring": email.tailoring,
+    }
+
+
+def _email_from_payload(d: dict) -> OutreachEmail:
+    return OutreachEmail(
+        to_email=d["to_email"],
+        to_name=d["to_name"],
+        subject=d["subject"],
+        body=d["body"],
+        from_name=d["from_name"],
+        from_email=d["from_email"],
+        company=d["company"],
+        job_title=d["job_title"],
+        opt_out=d["opt_out"],
+        tailoring=d.get("tailoring", "template"),
+    )
+
+
+def draft_key(job_id: str, to_email: str) -> str:
+    """Stable per-(job, recipient) identity for an outreach draft.
+
+    Re-assembling outreach for the same job + recipient updates the stored draft
+    in place rather than duplicating. The recipient address is normalised
+    (lower-cased, domain-normalised) so ``Jane@Acme.com`` and ``jane@acme.com``
+    key identically. A short BLAKE2b digest keeps the id compact and free of
+    characters that would complicate CLI fragment matching, while the job_id +
+    recipient pair guarantees no cross-job collision. Falls back to the stripped
+    lower-case address if it can't be normalised."""
+    local, _, dom = to_email.strip().lower().partition("@")
+    norm_dom = normalize_domain(dom) or dom
+    recipient = f"{local}@{norm_dom}" if local else to_email.strip().lower()
+    digest = hashlib.blake2b(
+        f"{job_id}\x00{recipient}".encode(), digest_size=10
+    ).hexdigest()
+    return f"d_{digest}"
 
 
 def contact_key(contact: Contact) -> str:
@@ -758,8 +849,180 @@ class JobStore:
         return row is not None
 
     # ------------------------------------------------------------------ #
+    # Outreach drafts (Slice F — draft-and-approve).
+    # ------------------------------------------------------------------ #
+    def save_draft(
+        self, job_id: str, email: OutreachEmail, *, now: datetime | None = None
+    ) -> StoredDraft:
+        """Upsert an outreach draft for a job + recipient. Returns the StoredDraft.
+
+        Keyed on :func:`draft_key` ``(job_id, to_email)`` so re-assembling outreach
+        for the same recipient refreshes the subject/body in place rather than
+        duplicating.
+
+        CRUCIAL: a draft that was ALREADY SENT is NOT overwritten. Re-running
+        ``outreach draft`` for a recipient you already emailed returns the existing
+        SENT record UNCHANGED (its ``status``/``sent_at``/body preserved) so the
+        caller can see it was already contacted and warn. This protects two things
+        at once — the "already contacted" record is never erased, and the send
+        gate's ``status is SENT`` re-send guard can't be silently re-armed by a
+        re-draft. A DRAFTED (not-yet-sent) draft refreshes in place as before.
+        """
+        now = now or _utcnow()
+        now_iso = _iso(now)
+        row_id = draft_key(job_id, email.to_email)
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(drafts_table.c.status, drafts_table.c.created_at).where(
+                    drafts_table.c.id == row_id
+                )
+            ).first()
+            if existing is not None and existing[0] == DraftStatus.SENT.value:
+                # Already sent — do not overwrite. Return the sent record as-is.
+                sent_row = conn.execute(
+                    select(
+                        drafts_table.c.id,
+                        drafts_table.c.job_id,
+                        drafts_table.c.payload,
+                        drafts_table.c.status,
+                        drafts_table.c.created_at,
+                        drafts_table.c.sent_at,
+                    ).where(drafts_table.c.id == row_id)
+                ).first()
+                return self._to_stored_draft(sent_row)
+            values = {
+                "job_id": job_id,
+                "to_email": email.to_email,
+                "status": DraftStatus.DRAFTED.value,
+                "subject": email.subject,
+                "sent_at": None,
+                "payload": _email_to_payload(email),
+            }
+            if existing is None:
+                conn.execute(
+                    drafts_table.insert().values(
+                        id=row_id, created_at=now_iso, **values
+                    )
+                )
+                created_iso = now_iso
+            else:
+                # DRAFTED → refresh in place; preserve the original created_at.
+                conn.execute(
+                    drafts_table.update()
+                    .where(drafts_table.c.id == row_id)
+                    .values(**values)
+                )
+                created_iso = existing[1]
+        return StoredDraft(
+            id=row_id,
+            job_id=job_id,
+            email=email,
+            status=DraftStatus.DRAFTED,
+            created_at=datetime.fromisoformat(created_iso),
+            sent_at=None,
+        )
+
+    def get_draft(self, draft_id: str) -> StoredDraft | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    drafts_table.c.id,
+                    drafts_table.c.job_id,
+                    drafts_table.c.payload,
+                    drafts_table.c.status,
+                    drafts_table.c.created_at,
+                    drafts_table.c.sent_at,
+                ).where(drafts_table.c.id == draft_id)
+            ).first()
+        return self._to_stored_draft(row) if row else None
+
+    def list_drafts(self, *, status: DraftStatus | None = None) -> list[StoredDraft]:
+        """All outreach drafts, newest first; optionally filtered by status."""
+        stmt = select(
+            drafts_table.c.id,
+            drafts_table.c.job_id,
+            drafts_table.c.payload,
+            drafts_table.c.status,
+            drafts_table.c.created_at,
+            drafts_table.c.sent_at,
+        ).order_by(drafts_table.c.created_at.desc(), drafts_table.c.id)
+        if status is not None:
+            stmt = stmt.where(drafts_table.c.status == status.value)
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+        return [self._to_stored_draft(r) for r in rows]
+
+    def find_draft_ids(self, prefix: str) -> list[str]:
+        """All draft ids starting with ``prefix`` (for CLI id resolution).
+
+        Mirrors :meth:`find_ids`: the fragment is matched as a LITERAL prefix with
+        SQL LIKE wildcards escaped, so a ``%``/``_`` fragment can't match drafts it
+        shouldn't (which, with a single stored draft, would let ``send`` target it
+        despite no real prefix being supplied)."""
+        pattern = _escape_like(prefix) + "%"
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(drafts_table.c.id)
+                .where(drafts_table.c.id.like(pattern, escape="\\"))
+                .order_by(drafts_table.c.id)
+            ).all()
+        return [r[0] for r in rows]
+
+    def claim_for_send(self, draft_id: str, *, now: datetime | None = None) -> bool:
+        """Atomically claim a DRAFTED draft for sending: flip it to SENT.
+
+        Returns True only if THIS call transitioned a still-``DRAFTED`` row to
+        ``SENT`` (the ``status == DRAFTED`` guard is in the UPDATE's WHERE, so the
+        check-and-set is one atomic statement). Returns False if the draft is
+        missing or already SENT. The CLI calls this **before** the network send, so
+        the row leaves the sendable state the instant we commit to sending — a
+        second ``send --confirm`` can never re-enter the send path (at-most-once).
+        A genuinely-failed send is rolled back with :meth:`unmark_sent`.
+        """
+        now = now or _utcnow()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                drafts_table.update()
+                .where(
+                    (drafts_table.c.id == draft_id)
+                    & (drafts_table.c.status == DraftStatus.DRAFTED.value)
+                )
+                .values(status=DraftStatus.SENT.value, sent_at=_iso(now))
+            )
+        return result.rowcount > 0
+
+    def unmark_sent(self, draft_id: str) -> bool:
+        """Revert a claimed draft back to DRAFTED (clearing ``sent_at``).
+
+        Used only when a claim_for_send succeeded but the actual send then FAILED,
+        so the user can legitimately retry. Returns True if a row changed. This is
+        the sole path back to DRAFTED after a claim, and it runs exclusively on the
+        send-failed branch — a *successful* send never reverts, so a delivered
+        email can't be resent.
+        """
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                drafts_table.update()
+                .where(drafts_table.c.id == draft_id)
+                .values(status=DraftStatus.DRAFTED.value, sent_at=None)
+            )
+        return result.rowcount > 0
+
+    # ------------------------------------------------------------------ #
     # Internals.
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _to_stored_draft(row) -> StoredDraft:
+        draft_id, job_id, payload, status, created_at, sent_at = row
+        return StoredDraft(
+            id=draft_id,
+            job_id=job_id,
+            email=_email_from_payload(payload),
+            status=DraftStatus(status),
+            created_at=datetime.fromisoformat(created_at),
+            sent_at=_dt_opt(sent_at),
+        )
+
     @staticmethod
     def _to_stored(row) -> StoredJob:
         payload, status, first_seen, last_seen, status_updated = row
